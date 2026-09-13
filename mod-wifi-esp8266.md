@@ -1,6 +1,6 @@
 # Olimex MOD-WIFI-ESP8266 on Olimex Agon Light 2
 
-This document describes how the **Olimex MOD-WIFI-ESP8266** module interfaces with the **Olimex Agon Light 2** retrocomputer, details its AT modem command interface, and analyzes its compatibility with the WIZnet WizFi360 AT sequence used in NitrOS-9 (`establish_wizfi.md` and `terminate_wizfi.md`).
+This document describes how the **Olimex MOD-WIFI-ESP8266** module interfaces with the **Olimex Agon Light 2** retrocomputer, details its AT modem command interface, and provides an end-to-end guide for establishing and managing transparent TCP/IP communication over UART1.
 
 ---
 
@@ -158,50 +158,48 @@ To break out of transparent stream mode back to AT command mode, the host must s
 
 ---
 
-## 4. Comparison with WIZnet WizFi360 (NitrOS-9 Wildbits)
+## 4. ESP-AT Command Reference & Architecture for Streaming
 
-The WIZnet WizFi360 module used on the Wildbits hardware platform running NitrOS-9 Level 2 (`establish_wizfi.md` and `terminate_wizfi.md`) was deliberately engineered as an AT-compatible and pin-compatible alternative to the Espressif ESP8266.
+The MOD-WIFI-ESP8266's ESP-AT firmware provides the complete command set necessary to manage wireless connectivity, configure network persistence, and maintain high-speed TCP streaming sessions.
 
-Consequently, **the MOD-WIFI-ESP8266 accepts the exact same AT command sequence.**
+### Command Reference Table
 
-### Command Compatibility Matrix
+| AT Command | Syntax / Example | Scope & Persistence | Purpose & Functional Behavior |
+| :--- | :--- | :--- | :--- |
+| `ATE` | `ATE1` / `ATE0` | RAM (Current Session) | Enables or disables command character echo on UART1. |
+| `AT+CWMODE_DEF` | `AT+CWMODE_DEF=1` | Flash (Persistent) | Sets Station (Wi-Fi client) mode and stores it in flash memory across reboots. |
+| `AT+CWDHCP_DEF` | `AT+CWDHCP_DEF=1,1` | Flash (Persistent) | Enables automatic DHCP IP assignment for Station mode and saves to flash. |
+| `AT+CWJAP_DEF` | `AT+CWJAP_DEF="SSID","PASS"` | Flash (Persistent) | Associates with the designated AP and commits credentials to flash for automatic reconnection. |
+| `AT+CIPSTA_CUR?` | `AT+CIPSTA_CUR?` | RAM (Query) | Queries the currently assigned IP address, gateway, and subnet mask from active memory. |
+| `AT+CIPMUX` | `AT+CIPMUX=0` | RAM (Current Session) | Enforces single-connection mode (mandatory prerequisite for transparent streaming). |
+| `AT+CIPMODE` | `AT+CIPMODE=1` | RAM (Current Session) | Activates transparent UART-to-WiFi passthrough transmission mode. |
+| `AT+CIPSTART` | `AT+CIPSTART="TCP","host",port` | RAM (Current Session) | Establishes the outbound TCP socket connection to the remote server. |
+| `AT+CIPSEND` | `AT+CIPSEND` | RAM (Current Session) | In `CIPMODE=1`, triggers unvarnished streaming mode and returns the `>` prompt. |
+| `+++` | `+++` (1s guard times) | Immediate | Standard Hayes escape sequence to exit streaming mode and return to AT command mode. |
+| `AT+CIPCLOSE` | `AT+CIPCLOSE` | Immediate | Cleanly terminates the active TCP socket connection. |
 
-| NitrOS-9 WizFi360 Command | ESP8266 ESP-AT Equivalent | Compatibility & Notes |
-| :--- | :--- | :--- |
-| `ATE1` | `ATE1` | **Identical.** Enables local command echo. |
-| `AT+CWMODE_DEF=1` | `AT+CWMODE_DEF=1` | **Identical.** Station mode committed to flash. |
-| `AT+CWDHCP_DEF=1,1` | `AT+CWDHCP_DEF=1,1` | **Identical.** Enables DHCP client on Station mode and saves to flash. |
-| `AT+CWJAP_DEF="ssid","pass"` | `AT+CWJAP_DEF="ssid","pass"` | **Identical.** Stores SSID/password in flash and auto-connects on boot. |
-| `AT+CIPSTA_CUR?` | `AT+CIPSTA_CUR?` | **Identical.** Queries current IP lease details from RAM. |
-| `AT+CIPMUX=0` | `AT+CIPMUX=0` | **Identical.** Enforces single-connection mode (prerequisite for `CIPMODE=1`). |
-| `AT+CIPMODE=1` | `AT+CIPMODE=1` | **Identical.** Enables transparent UART-WiFi passthrough. |
-| `AT+CIPSTART="TCP",...` | `AT+CIPSTART="TCP",...` | **Identical.** Establishes outbound TCP socket connection. |
-| `AT+CIPSEND` | `AT+CIPSEND` | **Identical.** Enters raw streaming mode; emits `OK` then `>`. |
-| `+++` (with 1s guard times) | `+++` (with 1s guard times) | **Identical.** Hayes escape sequence to exit streaming mode. |
-| `AT+CIPCLOSE` | `AT+CIPCLOSE` | **Identical.** Closes the open socket. |
+### Architectural Features of the MOD-WIFI-ESP8266
 
-### Technical Details Shared by Both Modules
+1. **Flash Parameter Persistence (`_DEF` vs `_CUR`):**
+   * The ESP-AT firmware differentiates between transient and persistent configurations using `_CUR` (current RAM state) and `_DEF` (default flash memory).
+   * Storing Wi-Fi configuration with `_DEF` commands (`CWMODE_DEF`, `CWDHCP_DEF`, `CWJAP_DEF`) means the MOD-WIFI-ESP8266 automatically re-associates with your wireless router and renews its DHCP lease upon every power-up without requiring any configuration code to run on the eZ80.
 
-1. **`_DEF` vs `_CUR` Persistence Suffixes:**
-   * Espressif introduced the `_DEF` (default / flash-persisted) and `_CUR` (current / RAM-only) suffixes in ESP-AT v1.0. WIZnet replicated this design.
-   * Storing parameters with `_DEF` means that on any subsequent reboot or power-on, the ESP8266 automatically associates with the network and acquires an IP address without host intervention.
+2. **Asynchronous Status Notification:**
+   * The ESP8266 emits asynchronous status strings during connection lifecycle events:
+     * `WIFI CONNECTED`: Association with the 802.11 AP succeeded.
+     * `WIFI GOT IP`: DHCP lease acquired from the local network router.
+     * `CONNECT`: Outbound TCP three-way handshake completed.
+     * `CLOSED`: Remote server or local module terminated the TCP connection.
+     * `OK` / `ERROR`: Standard AT command completion status.
 
-2. **Asynchronous Status Responses:**
-   * Status strings emitted by the ESP8266 during connection lifecycle match the WizFi360:
-     * `WIFI CONNECTED`
-     * `WIFI GOT IP`
-     * `CONNECT`
-     * `CLOSED`
-     * `OK` / `ERROR`
-
-3. **Guard Delay Rules:**
-   * Both modules require 1.0 second of silence before and after `+++`. Sending characters immediately before or appending `\r\n` to `+++` will cause the module to treat the plus signs as raw socket payload data rather than an escape command.
+3. **Strict Hayes Escape Guard Timing:**
+   * When escaping from transparent passthrough mode, the module requires at least 1.0 second of silence before the `+++` string, and at least 1.0 second of silence after. Sending characters immediately before or appending `\r\n` to `+++` will cause the ESP8266 to treat the plus characters as raw socket payload data rather than a mode escape trigger.
 
 ---
 
 ## 5. Software Access on the Agon Light 2
 
-Unlike the Wildbits platform (which interfaces to the WizFi360 through memory-mapped FPGA FIFO registers at `$FF20`–`$FF2F`), the Agon Light 2 accesses the MOD-WIFI-ESP8266 through standard UART serial I/O.
+On the Agon Light 2, the eZ80 communicates with the MOD-WIFI-ESP8266 across the dedicated serial interface on UART1. Software can interact with the module either through high-level MOS system calls or direct hardware register access.
 
 ### MOS API Calls
 Under MOS, programs can interact with UART1 via system calls:
@@ -218,3 +216,211 @@ For maximum throughput during transparent mode (such as block storage or raw str
 * `UART1_LSR`: Line Status Register (checks transmitter empty and receiver data ready bits).
 * `UART1_IER`: Interrupt Enable Register.
 * `UART1_BRG_L` / `UART1_BRG_H`: Baud Rate Generator registers for setting 115,200 baud.
+
+---
+
+## 6. End-to-End Operational Roadmap (UART1 TCP/IP Streaming)
+
+This roadmap outlines the complete lifecycle for establishing and managing a transparent TCP/IP communication stream between the Agon Light 2 and a remote server (e.g., FujiNet, DriveWire server, BBS, or custom file server) using UART1.
+
+### Operational Lifecycle Overview
+
+```
++-------------------------------------------------------------------------------+
+| PHASE 1: One-Time Wi-Fi Provisioning (Run once; persisted to flash)           |
+|   Open UART1 (115200 8N1) -> AT+CWMODE_DEF=1 -> AT+CWDHCP_DEF=1,1            |
+|   -> AT+CWJAP_DEF="SSID","PASS" -> Wait for "WIFI GOT IP" -> AT+CIPSTA_CUR?   |
++---------------------------------------+---------------------------------------+
+                                        |
+  (Subsequent reboots: Wi-Fi auto-connects to AP from Flash without Phase 1)
+                                        |
+                                        v
++-------------------------------------------------------------------------------+
+| PHASE 2: Connection Establishment & Passthrough Activation (Run per session)  |
+|   Verify Wi-Fi link (AT+CIPSTA?)                                              |
+|   -> Set single connection: AT+CIPMUX=0                                       |
+|   -> Enable transparent mode: AT+CIPMODE=1                                    |
+|   -> Connect TCP socket: AT+CIPSTART="TCP","host",port -> Wait for "CONNECT"   |
+|   -> Enter stream mode: AT+CIPSEND -> Wait for ">" prompt                     |
++---------------------------------------+---------------------------------------+
+                                        |
+                                        v
++-------------------------------------------------------------------------------+
+| PHASE 3: Active Bidirectional Streaming                                       |
+|   Direct UART1 byte transfers <========================> Raw TCP payload data |
+|   (Zero packet framing overhead / full 115,200 baud continuous stream)        |
++---------------------------------------+---------------------------------------+
+                                        |
+                                        v
++-------------------------------------------------------------------------------+
+| PHASE 4: Clean Teardown & Disconnection                                       |
+|   1.0s Pre-Guard silence window                                               |
+|   -> Send escape string: "+++" (No CR or LF)                                  |
+|   -> 1.0s Post-Guard silence window                                           |
+|   -> Issue socket close: AT+CIPCLOSE -> Wait for "CLOSED OK"                  |
+|   -> Restore normal mode: AT+CIPMODE=0                                        |
+|   -> Drain UART1 RX FIFO & close UART1 or return to MOS                       |
++-------------------------------------------------------------------------------+
+```
+
+### Phase 1: One-Time Wi-Fi Provisioning (Flash Persistence)
+
+This sequence is executed **only once** to pair the MOD-WIFI-ESP8266 with your local Wi-Fi router. Because the `_DEF` commands write configuration directly to the ESP8266's internal flash memory, the module automatically reconnects to this access point and acquires an IP address via DHCP upon every subsequent power-up.
+
+1. **Initialize UART1:**
+   Open UART1 at 115,200 baud, 8-N-1. Read and discard any residual characters currently residing in the receive FIFO.
+
+2. **Verify Module Presence:**
+   ```text
+   TX: AT\r\n
+   RX: OK\r\n
+   ```
+
+3. **Set Station Mode (Persist to Flash):**
+   ```text
+   TX: AT+CWMODE_DEF=1\r\n
+   RX: OK\r\n
+   ```
+
+4. **Enable DHCP Client (Persist to Flash):**
+   ```text
+   TX: AT+CWDHCP_DEF=1,1\r\n
+   RX: OK\r\n
+   ```
+
+5. **Associate with Access Point (Persist to Flash):**
+   ```text
+   TX: AT+CWJAP_DEF="MyWiFiSSID","MyWiFiPassword"\r\n
+   ```
+   Wait for the asynchronous association and DHCP handshake messages (may take up to 5-10 seconds):
+   ```text
+   RX: WIFI CONNECTED\r\n
+       WIFI GOT IP\r\n
+       \r\n
+       OK\r\n
+   ```
+
+6. **Verify Network Parameters:**
+   ```text
+   TX: AT+CIPSTA_CUR?\r\n
+   RX: +CIPSTA_CUR:ip:"192.168.1.50"\r\n
+       +CIPSTA_CUR:gateway:"192.168.1.1"\r\n
+       +CIPSTA_CUR:netmask:"255.255.255.0"\r\n
+       \r\n
+       OK\r\n
+   ```
+
+*From this point forward, Phase 1 is complete and never needs to be re-run unless the Wi-Fi credentials change.*
+
+---
+
+### Phase 2: Connection Establishment & Passthrough Activation
+
+This sequence is executed by software whenever it needs to initiate a network session with a remote server.
+
+1. **Verify Wi-Fi Link Readiness:**
+   Since the ESP8266 auto-associates at boot, query its current IP address to confirm connectivity:
+   ```text
+   TX: AT+CIPSTA?\r\n
+   RX: +CIPSTA:ip:"192.168.1.50"
+       +CIPSTA:gateway:"192.168.1.1"
+       +CIPSTA:netmask:"255.255.255.0"
+       OK\r\n
+   ```
+   If the IP address is `0.0.0.0`, wait 1-2 seconds and retry.
+
+2. **Enforce Single-Connection Mode:**
+   Transparent streaming strictly requires single-connection mode (`CIPMUX=0`).
+   ```text
+   TX: AT+CIPMUX=0\r\n
+   RX: OK\r\n
+   ```
+
+3. **Enable Transparent Passthrough Mode:**
+   Configure the serial engine for UART-to-WiFi passthrough:
+   ```text
+   TX: AT+CIPMODE=1\r\n
+   RX: OK\r\n
+   ```
+
+4. **Connect TCP Socket to Remote Server:**
+   Initiate the outbound connection (specify target host and port):
+   ```text
+   TX: AT+CIPSTART="TCP","192.168.1.100",65504\r\n
+   ```
+   Allow up to 3 seconds for the TCP three-way handshake (`SYN`, `SYN-ACK`, `ACK`). The module responds with:
+   ```text
+   RX: CONNECT\r\n
+       \r\n
+       OK\r\n
+   ```
+
+5. **Activate Continuous Streaming Mode:**
+   Send `AT+CIPSEND` without length arguments:
+   ```text
+   TX: AT+CIPSEND\r\n
+   ```
+   The module returns confirmation followed by the prompt token:
+   ```text
+   RX: \r\nOK\r\n
+       \r\n>
+   ```
+   Wait until the `>` character is received across UART1. The stream is now open.
+
+---
+
+### Phase 3: Active Bidirectional Streaming
+
+Once the `>` prompt is received, the module enters unvarnished transparent streaming mode:
+
+* **Outbound Traffic:** Every byte transmitted by the eZ80 to UART1 (`UART1_THR` or `mos_uputc`) is encapsulated directly into outbound TCP packets by the ESP8266.
+* **Inbound Traffic:** Inbound TCP data received from the remote server is unbundled by the ESP8266 and placed directly into the UART1 receive register (`UART1_RBR` or `mos_ugetc`) with no protocol headers, checksum wrappers, or `+IPD` frames.
+* **Flow Control / Throughput:** The link operates at the full 115,200 baud rate (~11.5 KB/sec raw throughput). Because hardware flow control (RTS/CTS) is not wired on UEXT, the receiving software should read UART1 promptly or use interrupt-driven ring buffers to avoid RX FIFO overruns.
+
+---
+
+### Phase 4: Clean Teardown & Full Disconnection
+
+When the application finishes or needs to close the remote session, it must break out of streaming mode, terminate the TCP socket, and flush the serial interface to prevent stale data from corrupting future operations.
+
+1. **Step 1: Enforce Pre-Guard Silence:**
+   Stop all data transmission across UART1. Maintain complete silence (no bytes sent) for a minimum of **1.0 second (1,000 ms)**.
+   *Note: If any characters are transmitted during this window, the ESP8266 will not recognize the subsequent escape sequence.*
+
+2. **Step 2: Transmit Hayes Escape Sequence:**
+   Send exactly three ASCII plus characters with no line terminators:
+   ```text
+   TX: +++
+   ```
+   *Note: Do NOT send `\r` (`0x0D`) or `\n` (`0x0A`). Sending `+++\r\n` will cause the module to treat the plus signs as regular socket payload data.*
+
+3. **Step 3: Enforce Post-Guard Silence:**
+   Maintain complete silence for another minimum of **1.0 second (1,000 ms)**.
+   During this pause, the ESP8266 detects the guard boundary, suspends transparent streaming, and switches back to AT command mode.
+
+4. **Step 4: Close the TCP Socket:**
+   Send the close command:
+   ```text
+   TX: AT+CIPCLOSE\r\n
+   ```
+   Wait approximately 500 ms to 1.0 second for the remote host and ESP8266 to exchange TCP `FIN` / `ACK` packets.
+   The ESP8266 emits:
+   ```text
+   RX: CLOSED\r\n
+       \r\n
+       OK\r\n
+   ```
+
+5. **Step 5: Flush Receive Buffers:**
+   Read and discard all incoming bytes from UART1 until the receive buffer is completely empty. This ensures leftover strings (`CLOSED`, `OK`) are not mistakenly read as data by subsequent routines.
+
+6. **Step 6: Reset Mode to Standard (Defensive Teardown):**
+   Disable transparent transmission mode so the module returns to standard command processing:
+   ```text
+   TX: AT+CIPMODE=0\r\n
+   RX: OK\r\n
+   ```
+
+7. **Step 7: Release UART1:**
+   Close the UART1 channel via `mos_uclose` or reconfigure it as required by your application.
+
