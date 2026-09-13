@@ -1,0 +1,11 @@
+# Downloaded upstream sources and documentation
+TRSDOS_7/
+TRSDOS_GLOBAL/
+*.pdf
+readme.txt
+
+# Downloaded archives
+*.zip
+
+# OS metadata
+.DS_Store
