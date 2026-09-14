@@ -18,6 +18,9 @@ The Olimex MOD-WIFI-ESP8266 plugs directly into this UEXT header without requiri
 * **Baud Rate:** 115,200 bps.
 * **Framing:** 8 data bits, no parity, 1 stop bit (8-N-1).
 * **Flow Control:** None (hardware RTS/CTS lines are not wired on the standard UEXT connector).
+* **eZ80 Pin Multiplexing:** `TXD1` and `RXD1` are multiplexed with Port D GPIO pins `PD4` and `PD5`. While MOS configures these at boot, custom operating system kernels or bare-metal code must ensure `PD_ALT1` and `PD_ALT2` enable the alternate function on Port D pins 4 and 5 to route signals to the UART1 hardware.
+* **Power Supply & Current Transients:** The ESP8266 power amplifier consumes transient current spikes between 250 mA and 300 mA during RF packet transmission. The Agon Light 2 host power source (typically USB) must supply at least 500 mA to 1 A of clean 5V DC to prevent 3.3V rail brownouts and CPU reset events during Wi-Fi bursts.
+* **Data Integrity:** Because the physical wire uses 8-N-1 without hardware parity or flow control, higher-level block storage protocols (such as virtual disk transfers) should implement protocol-level checksums (such as CRC-16) to verify data integrity against electrical noise.
 
 ### UEXT Pin Mapping
 
@@ -25,14 +28,15 @@ The Olimex MOD-WIFI-ESP8266 plugs directly into this UEXT header without requiri
 | :--- | :--- | :--- | :--- |
 | **Pin 1** | `3.3V` | `VCC` | 3.3V DC power supplied by the Agon Light 2 |
 | **Pin 2** | `GND` | `GND` | Common ground |
-| **Pin 3** | `TXD1` | `RXD` | eZ80 UART1 Transmit -> ESP8266 Receive |
-| **Pin 4** | `RXD1` | `TXD` | eZ80 UART1 Receive <- ESP8266 Transmit |
+| **Pin 3** | `TXD1` | `RXD` | eZ80 UART1 Transmit (PD4) -> ESP8266 Receive (GPIO3) |
+| **Pin 4** | `RXD1` | `TXD` | eZ80 UART1 Receive (PD5) <- ESP8266 Transmit (GPIO1) |
 | **Pin 5** | `SCL` | *NC* | I2C clock (unused by module) |
 | **Pin 6** | `SDA` | *NC* | I2C data (unused by module) |
 | **Pin 7** | `MISO` | *NC* | SPI data in (unused by module) |
 | **Pin 8** | `MOSI` | *NC* | SPI data out (unused by module) |
 | **Pin 9** | `SCK` | *NC* | SPI clock (unused by module) |
 | **Pin 10** | `CS` | *NC* | SPI chip select (unused by module) |
+
 
 ---
 
@@ -88,6 +92,7 @@ In command mode, every transmission to the module is an ASCII command string end
       WIFI GOT IP
       OK
   ```
+  *(If association fails, the module returns `+CWJAP:<error_code>` followed by `FAIL`, where `1` = Connection timeout, `2` = Wrong password, `3` = Target AP not found, `4` = Connection failed).*
 * **Query IP Lease:**
   ```text
   TX: AT+CIPSTA?
@@ -96,6 +101,13 @@ In command mode, every transmission to the module is an ASCII command string end
       +CIPSTA:netmask:"255.255.255.0"
       OK
   ```
+* **Query Connection Status:**
+  ```text
+  TX: AT+CIPSTATUS
+  RX: STATUS:2
+      OK
+  ```
+  *(Status values: `2` = Station got IP / ready, `3` = TCP/UDP transmission connected, `4` = Socket disconnected, `5` = Wi-Fi disconnected).*
 
 #### 2. Normal Socket Mode (Framed Transfer)
 * **Open Socket:**
@@ -110,7 +122,8 @@ In command mode, every transmission to the module is an ASCII command string end
   RX: OK
       >
   TX: Hello World!
-  RX: SEND OK
+  RX: Recv 12 bytes
+      SEND OK
   ```
 * **Receive Data:**
   Incoming data from the remote host is framed with length prefixes:
@@ -147,6 +160,7 @@ The module provides **UART-WiFi Passthrough Mode** (`CIPMODE=1`), which converts
    * Any byte written to UART1 is packaged directly into a TCP packet.
    * Any byte received from the TCP socket is placed directly onto UART1 without `+IPD` wrappers.
    * AT commands are ignored.
+   * **Packetization Latency:** The ESP8266 automatically flushes buffered serial data into a TCP packet when either 2,048 bytes accumulate or a **20 ms silence interval** occurs on UART1. For small request/response transactions, this 20 ms idle threshold introduces a fixed round-trip latency floor.
 
 #### Exiting Transparent Mode:
 To break out of transparent stream mode back to AT command mode, the host must send the standard Hayes escape sequence with strict guard timing:
@@ -154,7 +168,8 @@ To break out of transparent stream mode back to AT command mode, the host must s
 1. **Pre-guard delay:** Maintain at least 1.0 second of total silence (no bytes sent over UART1).
 2. **Escape sequence:** Send exactly three plus characters: `+++` (do not append `\r` or `\n`).
 3. **Post-guard delay:** Wait at least 1.0 second of total silence.
-4. **Close socket:** Send `AT+CIPCLOSE\r\n`.
+4. **No Response Warning:** The ESP8266 emits **no response token (such as `OK`)** upon escaping via `+++`. Software must not block waiting for an acknowledgment; after the 1.0-second post-guard silence, the module is ready to accept regular AT commands.
+5. **Close socket:** Send `AT+CIPCLOSE\r\n`.
 
 ---
 
@@ -167,16 +182,18 @@ The MOD-WIFI-ESP8266's ESP-AT firmware provides the complete command set necessa
 | AT Command | Syntax / Example | Scope & Persistence | Purpose & Functional Behavior |
 | :--- | :--- | :--- | :--- |
 | `ATE` | `ATE1` / `ATE0` | RAM (Current Session) | Enables or disables command character echo on UART1. |
-| `AT+CWMODE_DEF` | `AT+CWMODE_DEF=1` | Flash (Persistent) | Sets Station (Wi-Fi client) mode and stores it in flash memory across reboots. |
+| `AT+CWMODE_DEF` | `AT+CWMODE_DEF=1` | Flash (Persistent) | Sets Station mode, disabling default SoftAP broadcast and saving to flash. |
 | `AT+CWDHCP_DEF` | `AT+CWDHCP_DEF=1,1` | Flash (Persistent) | Enables automatic DHCP IP assignment for Station mode and saves to flash. |
 | `AT+CWJAP_DEF` | `AT+CWJAP_DEF="SSID","PASS"` | Flash (Persistent) | Associates with the designated AP and commits credentials to flash for automatic reconnection. |
 | `AT+CIPSTA_CUR?` | `AT+CIPSTA_CUR?` | RAM (Query) | Queries the currently assigned IP address, gateway, and subnet mask from active memory. |
+| `AT+CIPSTATUS` | `AT+CIPSTATUS` | RAM (Query) | Queries connection status (`2` = Got IP, `3` = Connected, `4` = Disconnected, `5` = Wi-Fi lost). |
 | `AT+CIPMUX` | `AT+CIPMUX=0` | RAM (Current Session) | Enforces single-connection mode (mandatory prerequisite for transparent streaming). |
 | `AT+CIPMODE` | `AT+CIPMODE=1` | RAM (Current Session) | Activates transparent UART-to-WiFi passthrough transmission mode. |
 | `AT+CIPSTART` | `AT+CIPSTART="TCP","host",port` | RAM (Current Session) | Establishes the outbound TCP socket connection to the remote server. |
 | `AT+CIPSEND` | `AT+CIPSEND` | RAM (Current Session) | In `CIPMODE=1`, triggers unvarnished streaming mode and returns the `>` prompt. |
-| `+++` | `+++` (1s guard times) | Immediate | Standard Hayes escape sequence to exit streaming mode and return to AT command mode. |
+| `+++` | `+++` (1s guard times) | Immediate | Standard Hayes escape sequence to exit streaming mode (silently returns to AT mode, no `OK`). |
 | `AT+CIPCLOSE` | `AT+CIPCLOSE` | Immediate | Cleanly terminates the active TCP socket connection. |
+
 
 ### Architectural Features of the MOD-WIFI-ESP8266
 
@@ -199,72 +216,47 @@ The MOD-WIFI-ESP8266's ESP-AT firmware provides the complete command set necessa
 
 ## 5. Software Access, Buffering & Flow Control Architecture
 
-On the Agon Light 2, the eZ80 communicates with the MOD-WIFI-ESP8266 across the dedicated serial interface on UART1. Because the standard UEXT connector does not route hardware flow control lines (RTS/CTS), serial communication relies on hardware FIFOs, interrupt service routines, and multi-tier software buffers on both the eZ80 host and the ESP8266 coprocessor.
+On the Agon Light 2, the eZ80 communicates with the MOD-WIFI-ESP8266 across the dedicated serial interface on UART1. Because the standard UEXT connector routes only TXD1 and RXD1 (3.3V TTL) without hardware flow control lines (RTS/CTS), serial communication relies entirely on hardware FIFOs, interrupt service routines, and multi-tier software buffers on both the host and the coprocessor.
 
-### A. MOS API Calls
-Under MOS, programs can interact with UART1 via system calls:
+### A. Software Access Interfaces
+Software running on the eZ80 can interface with UART1 at two levels:
+* **High-Level MOS APIs:** Standard MOS system calls (`mos_uopen`, `mos_uclose`, `mos_ugetc`, `mos_uputc`) that manage serial framing and operate against an interrupt-driven software circular buffer in eZ80 RAM.
+* **Direct Hardware Register Access:** Direct I/O access to the eZ80 UART1 registers to maximize throughput and eliminate operating system overhead during high-speed streaming:
+  * `UART1_RBR` (I/O `$D0`, DLAB=0, Read): Receiver Buffer Register (reads top of 16-byte RX FIFO).
+  * `UART1_THR` (I/O `$D0`, DLAB=0, Write): Transmitter Holding Register (writes to TX shift register/FIFO).
+  * `UART1_IER` (I/O `$D1`, DLAB=0): Interrupt Enable Register (Bit 0 = `RIE` receiver interrupt, Bit 1 = `TIE` transmit empty interrupt, Bit 3 = `MSIE` modem status interrupt).
+  * `UART1_IIR` / `UART1_FCR` (I/O `$D2`): Shared address. Reading returns the Interrupt Identification Register (`IIR`). Writing configures the FIFO Control Register (`FCR`): Bit 0 (`FIFOEN`) enables the 16-byte hardware FIFOs, Bits 1–2 clear FIFOs, and Bits 6–7 select the RX FIFO trigger threshold (00 = 1 byte, 01 = 4 bytes, 10 = 8 bytes, 11 = 14 bytes).
+  * `UART1_LCR` (I/O `$D3`): Line Control Register. Bits 0–1 set character length (11 = 8 bits). Bit 7 is `DLAB` (Divisor Latch Access Bit), which must be set to 1 to write baud divisor registers and cleared to 0 for normal data I/O.
+  * `UART1_LSR` (I/O `$D5`): Line Status Register. Bit 0 = `DR` (Data Ready), Bit 1 = `OE` (Overrun Error), Bit 5 = `THRE` (Transmitter Holding Register Empty), Bit 6 = `TEMT` (Transmitter Empty).
+  * `UART1_BRG_L` / `UART1_BRG_H` (I/O `$D0`/`$D1`, DLAB=1): Baud Rate Generator divisor registers. For a system clock of 18.432 MHz and target baud rate of 115,200 bps:
+    $$\text{Divisor} = \frac{18,432,000}{16 \times 115,200} = 10 \quad (\text{0x000A})$$
+    Setting `BRG_L = 10` and `BRG_H = 0` produces exact 115,200 baud with 0.00% clock timing error.
 
-* **`mos_uopen`:** Initializes and configures UART1 baud rate, data bits, stop bits, and parity.
-* **`mos_uclose`:** Closes the UART1 interface and releases buffers.
-* **`mos_ugetc`:** Reads an incoming character from the UART1 receive buffer.
-* **`mos_uputc`:** Transmits an outgoing character across UART1.
 
-### B. Direct eZ80 Hardware Register Access
-For maximum throughput during transparent mode (such as block storage or raw streaming), software can bypass MOS and access the eZ80 UART1 hardware registers directly:
+### B. Incoming Character Detection & Alerting Architecture
+While modem status lines (like CTS, DSR, DCD, and RI) historically triggered UART Modem Status Interrupts (`MSIE`) to signal carrier and line state changes, they do not pulse on individual character arrivals:
+* **Asynchronous Start-Bit Detection:** Incoming characters are detected directly on the `RXD1` pin via start-bit falling-edge detection, shifting serial data into the 16-byte hardware receiver FIFO.
+* **Interrupt-Driven Alerting:** Setting the Receiver Interrupt Enable (`RIE`) bit in `UART1_IER` raises the `UART1_IVECT` interrupt when the FIFO reaches its configured threshold (1, 4, 8, or 14 bytes) or upon a character timeout.
+* **Polled Alerting:** Dedicated drivers running with interrupts disabled poll the Data Ready (`DR`) status flag in `UART1_LSR` to immediately extract characters as they land in `UART1_RBR`.
 
-* `UART1_RBR` / `UART1_THR`: Receive Buffer Register / Transmitter Holding Register.
-* `UART1_LSR`: Line Status Register (checks transmitter empty and receiver data ready bits).
-* `UART1_IER`: Interrupt Enable Register.
-* `UART1_BRG_L` / `UART1_BRG_H`: Baud Rate Generator registers for setting 115,200 baud.
+### C. Multi-Tier Coprocessor Buffering
+The MOD-WIFI-ESP8266 is an autonomous, deeply buffered network coprocessor rather than an unbuffered serial device. Characters transmitted by the eZ80 are staged through three distinct layers:
+1. **Hardware UART RX FIFO (128 bytes):** Captures incoming wire bursts directly at 115,200 baud.
+2. **ESP-AT Driver Ring Buffer (512–2048 bytes):** A high-priority firmware ISR continuously offloads the hardware FIFO into an internal RAM buffer.
+3. **LwIP TCP Socket Buffers (Up to 2048 bytes per segment):** In transparent streaming mode (`CIPMODE=1`), the coprocessor aggregates stream data into TCP segments, transmitting them over Wi-Fi when the buffer reaches 2,048 bytes or upon a 20 ms UART idle timeout.
 
-### C. Incoming Character Detection on the eZ80 (RX Architecture)
-RTS/CTS lines perform transmission throttling rather than character notification. On the Agon Light 2, the eZ80 detects incoming characters from the ESP8266 using either hardware interrupts or register polling:
+### D. Timing Margins & Flow Control Semantics
+* **Host Receiver Headroom:** Although an empty 16-byte FIFO takes approximately 1.38 ms to fill at 115,200 baud (86.8 µs per character), interrupt-driven systems fire at intermediate thresholds. When configured with a 14-byte trigger level, the CPU has a strict 2-character margin (approximately 174 µs) to enter the ISR and service the FIFO before an overrun error (`OE`) occurs.
+* **Layer 4 Flow Control vs. Wire Throttling:** Physical RTS/CTS originated in telecommunications for half-duplex carrier turnaround and was only later co-opted for buffer pacing. In this architecture, wire-level throttling is unnecessary because end-to-end backpressure is handled at Layer 4 by TCP sliding windows between the ESP8266 and the remote server.
+* **Bandwidth & Latency Asymmetry:** Normal Wi-Fi throughput vastly exceeds the 11.5 KB/s serial rate, allowing the coprocessor to drain its buffers near-instantaneously. However, firmware latency spikes on the ESP8266 (such as RF calibration or beacon resynchronization lasting 5–15 ms) can occasionally threaten its 128-byte hardware FIFO (which fills in 11.1 ms).
 
-1. **Hardware Interrupt-Driven RX (Standard MOS Architecture):**
-   * The eZ80 features a 16550-compatible UART with an internal **16-byte hardware RX FIFO**.
-   * Setting bit 0 (`RIE` — Receiver Interrupt Enable) in `UART1_IER` causes the UART to assert the `UART1_IVECT` vectored interrupt under two conditions:
-     * **FIFO Trigger Threshold:** The number of received bytes in the FIFO reaches a preconfigured level (1, 4, 8, or 14 bytes).
-     * **Character Timeout:** Unread characters remain in the FIFO for approximately 4 character durations without new bytes arriving.
-   * The MOS UART1 Interrupt Service Routine (ISR) intercepts this vector, unloads bytes from `UART1_RBR`, and inserts them into an in-memory **circular ring buffer** in eZ80 RAM. Applications retrieve characters asynchronously by calling `mos_ugetc()`.
+### E. Driver Modernization: Adapting Legacy Serial Drivers for Streaming
+Legacy operating system drivers (such as the TRS-OS network client) were architected around unbuffered null-modem serial cables, employing per-character RTS/CTS stop-and-wait handshaking (asserting RTS, polling CTS, and waiting on every single byte). When interfacing with the MOD-WIFI-ESP8266 on UEXT, drivers should be restructured conceptually:
 
-2. **Direct Register Polling (Polled Driver Loops):**
-   * In tight, dedicated driver loops where interrupts are disabled, software continuously checks bit 0 (`DR` — Data Ready) of the Line Status Register (`UART1_LSR`).
-   * When `DR` is `1`, at least one unread character is available in `UART1_RBR`. Reading `UART1_RBR` clears the `DR` bit until the next byte arrives:
-     ```assembly
-     poll_rx:   in0   a, (UART1_LSR)
-                bit   0, a              ; Check DR (Data Ready) bit
-                jr    z, poll_rx        ; Loop until a character arrives
-                in0   a, (UART1_RBR)    ; Read byte from receiver register
-     ```
-
-### D. Outgoing Buffering & Packetization on the ESP8266 (TX Architecture)
-Characters transmitted by the eZ80 across UART1 are captured and buffered across three distinct layers inside the MOD-WIFI-ESP8266:
-
-1. **ESP8266 Hardware RX FIFO (128 bytes):**
-   The ESP8266 UART input is backed by a physical 128-byte hardware FIFO that receives incoming serial bytes directly from the wire.
-2. **ESP-AT Firmware Ring Buffer (512 to 2048 bytes):**
-   A dedicated high-priority interrupt handler in the ESP-AT firmware continuously drains the 128-byte hardware FIFO into an allocated circular ring buffer in ESP8266 RAM.
-3. **LwIP TCP Socket Buffers (Up to 2048 bytes per packet):**
-   In transparent streaming mode (`CIPMODE=1`), the ESP8266 batches buffered UART data into TCP segments. A TCP packet is transmitted over Wi-Fi when either:
-   * A total of **2,048 bytes** accumulate in the buffer, or
-   * A **20 ms silence interval** (no new serial characters) occurs on UART1.
-
-### E. Flow Control & Timing Constraints Without RTS/CTS
-
-1. **Absence of Host Throttling:**
-   Because no physical RTS line connects from the eZ80 to the ESP8266, the eZ80 cannot signal the ESP8266 to pause transmission. If the eZ80 disables interrupts or fails to service `UART1_RBR` while data is arriving, the 16-byte hardware FIFO will overflow, setting the Overrun Error bit (`OE`, bit 1 in `UART1_LSR`) and discarding subsequent bytes.
-   * At **115,200 baud**, one byte arrives every **86.8 microseconds**.
-   * At **18.432 MHz**, the eZ80 executes approximately **1,600 clock cycles per incoming byte**.
-   * The 16-byte hardware FIFO affords a maximum grace period of **1.38 milliseconds** before an overrun occurs.
-
-2. **Bandwidth Asymmetry:**
-   Under normal conditions, buffer overruns do not occur on the ESP8266 during host-to-module transmission:
-   * **UART1 Transmit Bandwidth:** 115,200 baud yields approximately **11.5 KB/s**.
-   * **Wi-Fi Transmit Bandwidth:** 802.11n Wi-Fi operates at **hundreds of kilobytes to megabytes per second**.
-   Because the Wi-Fi transmission pipe is orders of magnitude faster than the serial input, the ESP8266 empties its buffers nearly instantaneously.
-
-3. **Network Stalls & Backpressure:**
-   If the remote TCP host stops acknowledging packets (TCP window exhaustion) or the Wi-Fi connection drops, the ESP8266's internal TCP and UART buffers will eventually fill completely. Without a CTS line to throttle the eZ80, continued serial transmission during an unacknowledged network stall will cause the ESP8266's internal buffers to overflow, resulting in lost transmit bytes.
+* **Eliminate Hardware CTS Polling:** Remove routines that poll CTS in the Modem Status Register (`UART1_MSR`). On UEXT, the CTS pin is floating or unrouted; polling it results in permanent driver deadlocks or timeouts. Outbound readiness should be determined solely by checking the Transmitter Holding Register Empty (`THRE`) flag in `UART1_LSR`.
+* **Eliminate Per-Byte RTS Toggling:** Strip out the port writes that toggle RTS in the Modem Control Register (`UART1_MCTL`) before and after each character read. The ESP8266 has no RTS connection and cannot see this signal; removing these cycles reclaims substantial CPU time.
+* **Transition from Byte-by-Byte to Block-Level Transfers:** For block devices (such as virtual disk sector transfers of 256 bytes), replace repetitive single-byte driver dispatch calls with tightly coupled, inline burst loops. Because an 18.432 MHz eZ80 polling loop consumes less than 1 µs per iteration compared to the 86.8 µs character arrival time, the host easily outpaces the incoming serial stream without requiring wire-level flow control.
+* **Rely on Protocol-Level Request-Response Framing:** Instead of pacing each byte over the physical wire, rely on the inherently half-duplex nature of disk request/response transactions and TCP sliding windows to prevent buffer starvation or overflows.
 
 ---
 
@@ -368,15 +360,13 @@ This sequence is executed **only once** to pair the MOD-WIFI-ESP8266 with your l
 This sequence is executed by software whenever it needs to initiate a network session with a remote server.
 
 1. **Verify Wi-Fi Link Readiness:**
-   Since the ESP8266 auto-associates at boot, query its current IP address to confirm connectivity:
+   Since the ESP8266 auto-associates at boot from flash parameters, query its connection state:
    ```text
-   TX: AT+CIPSTA?\r\n
-   RX: +CIPSTA:ip:"192.168.1.50"
-       +CIPSTA:gateway:"192.168.1.1"
-       +CIPSTA:netmask:"255.255.255.0"
+   TX: AT+CIPSTATUS\r\n
+   RX: STATUS:2
        OK\r\n
    ```
-   If the IP address is `0.0.0.0`, wait 1-2 seconds and retry.
+   *Note: `STATUS:2` confirms the station has successfully acquired a DHCP IP address and is ready for socket connections. If `STATUS:5`, the module is still associating.*
 
 2. **Enforce Single-Connection Mode:**
    Transparent streaming strictly requires single-connection mode (`CIPMUX=0`).
@@ -446,6 +436,7 @@ When the application finishes or needs to close the remote session, it must brea
 3. **Step 3: Enforce Post-Guard Silence:**
    Maintain complete silence for another minimum of **1.0 second (1,000 ms)**.
    During this pause, the ESP8266 detects the guard boundary, suspends transparent streaming, and switches back to AT command mode.
+   *Important: The ESP8266 emits NO response string (such as `OK`) upon escaping via `+++`. Software must not wait for an acknowledgment; after the 1.0-second delay, the module is ready to accept commands.*
 
 4. **Step 4: Close the TCP Socket:**
    Send the close command:
