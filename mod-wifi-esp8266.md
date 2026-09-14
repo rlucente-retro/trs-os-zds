@@ -197,11 +197,11 @@ The MOD-WIFI-ESP8266's ESP-AT firmware provides the complete command set necessa
 
 ---
 
-## 5. Software Access on the Agon Light 2
+## 5. Software Access, Buffering & Flow Control Architecture
 
-On the Agon Light 2, the eZ80 communicates with the MOD-WIFI-ESP8266 across the dedicated serial interface on UART1. Software can interact with the module either through high-level MOS system calls or direct hardware register access.
+On the Agon Light 2, the eZ80 communicates with the MOD-WIFI-ESP8266 across the dedicated serial interface on UART1. Because the standard UEXT connector does not route hardware flow control lines (RTS/CTS), serial communication relies on hardware FIFOs, interrupt service routines, and multi-tier software buffers on both the eZ80 host and the ESP8266 coprocessor.
 
-### MOS API Calls
+### A. MOS API Calls
 Under MOS, programs can interact with UART1 via system calls:
 
 * **`mos_uopen`:** Initializes and configures UART1 baud rate, data bits, stop bits, and parity.
@@ -209,13 +209,62 @@ Under MOS, programs can interact with UART1 via system calls:
 * **`mos_ugetc`:** Reads an incoming character from the UART1 receive buffer.
 * **`mos_uputc`:** Transmits an outgoing character across UART1.
 
-### Direct eZ80 Hardware Register Access
+### B. Direct eZ80 Hardware Register Access
 For maximum throughput during transparent mode (such as block storage or raw streaming), software can bypass MOS and access the eZ80 UART1 hardware registers directly:
 
 * `UART1_RBR` / `UART1_THR`: Receive Buffer Register / Transmitter Holding Register.
 * `UART1_LSR`: Line Status Register (checks transmitter empty and receiver data ready bits).
 * `UART1_IER`: Interrupt Enable Register.
 * `UART1_BRG_L` / `UART1_BRG_H`: Baud Rate Generator registers for setting 115,200 baud.
+
+### C. Incoming Character Detection on the eZ80 (RX Architecture)
+RTS/CTS lines perform transmission throttling rather than character notification. On the Agon Light 2, the eZ80 detects incoming characters from the ESP8266 using either hardware interrupts or register polling:
+
+1. **Hardware Interrupt-Driven RX (Standard MOS Architecture):**
+   * The eZ80 features a 16550-compatible UART with an internal **16-byte hardware RX FIFO**.
+   * Setting bit 0 (`RIE` — Receiver Interrupt Enable) in `UART1_IER` causes the UART to assert the `UART1_IVECT` vectored interrupt under two conditions:
+     * **FIFO Trigger Threshold:** The number of received bytes in the FIFO reaches a preconfigured level (1, 4, 8, or 14 bytes).
+     * **Character Timeout:** Unread characters remain in the FIFO for approximately 4 character durations without new bytes arriving.
+   * The MOS UART1 Interrupt Service Routine (ISR) intercepts this vector, unloads bytes from `UART1_RBR`, and inserts them into an in-memory **circular ring buffer** in eZ80 RAM. Applications retrieve characters asynchronously by calling `mos_ugetc()`.
+
+2. **Direct Register Polling (Polled Driver Loops):**
+   * In tight, dedicated driver loops where interrupts are disabled, software continuously checks bit 0 (`DR` — Data Ready) of the Line Status Register (`UART1_LSR`).
+   * When `DR` is `1`, at least one unread character is available in `UART1_RBR`. Reading `UART1_RBR` clears the `DR` bit until the next byte arrives:
+     ```assembly
+     poll_rx:   in0   a, (UART1_LSR)
+                bit   0, a              ; Check DR (Data Ready) bit
+                jr    z, poll_rx        ; Loop until a character arrives
+                in0   a, (UART1_RBR)    ; Read byte from receiver register
+     ```
+
+### D. Outgoing Buffering & Packetization on the ESP8266 (TX Architecture)
+Characters transmitted by the eZ80 across UART1 are captured and buffered across three distinct layers inside the MOD-WIFI-ESP8266:
+
+1. **ESP8266 Hardware RX FIFO (128 bytes):**
+   The ESP8266 UART input is backed by a physical 128-byte hardware FIFO that receives incoming serial bytes directly from the wire.
+2. **ESP-AT Firmware Ring Buffer (512 to 2048 bytes):**
+   A dedicated high-priority interrupt handler in the ESP-AT firmware continuously drains the 128-byte hardware FIFO into an allocated circular ring buffer in ESP8266 RAM.
+3. **LwIP TCP Socket Buffers (Up to 2048 bytes per packet):**
+   In transparent streaming mode (`CIPMODE=1`), the ESP8266 batches buffered UART data into TCP segments. A TCP packet is transmitted over Wi-Fi when either:
+   * A total of **2,048 bytes** accumulate in the buffer, or
+   * A **20 ms silence interval** (no new serial characters) occurs on UART1.
+
+### E. Flow Control & Timing Constraints Without RTS/CTS
+
+1. **Absence of Host Throttling:**
+   Because no physical RTS line connects from the eZ80 to the ESP8266, the eZ80 cannot signal the ESP8266 to pause transmission. If the eZ80 disables interrupts or fails to service `UART1_RBR` while data is arriving, the 16-byte hardware FIFO will overflow, setting the Overrun Error bit (`OE`, bit 1 in `UART1_LSR`) and discarding subsequent bytes.
+   * At **115,200 baud**, one byte arrives every **86.8 microseconds**.
+   * At **18.432 MHz**, the eZ80 executes approximately **1,600 clock cycles per incoming byte**.
+   * The 16-byte hardware FIFO affords a maximum grace period of **1.38 milliseconds** before an overrun occurs.
+
+2. **Bandwidth Asymmetry:**
+   Under normal conditions, buffer overruns do not occur on the ESP8266 during host-to-module transmission:
+   * **UART1 Transmit Bandwidth:** 115,200 baud yields approximately **11.5 KB/s**.
+   * **Wi-Fi Transmit Bandwidth:** 802.11n Wi-Fi operates at **hundreds of kilobytes to megabytes per second**.
+   Because the Wi-Fi transmission pipe is orders of magnitude faster than the serial input, the ESP8266 empties its buffers nearly instantaneously.
+
+3. **Network Stalls & Backpressure:**
+   If the remote TCP host stops acknowledging packets (TCP window exhaustion) or the Wi-Fi connection drops, the ESP8266's internal TCP and UART buffers will eventually fill completely. Without a CTS line to throttle the eZ80, continued serial transmission during an unacknowledged network stall will cause the ESP8266's internal buffers to overflow, resulting in lost transmit bytes.
 
 ---
 
