@@ -1,12 +1,12 @@
-# Olimex MOD-WIFI-ESP8266 on Olimex Agon Light 2
+# MOD-WIFI-ESP8266 on the Agon Family
 
-This document describes how the **Olimex MOD-WIFI-ESP8266** module interfaces with the **Olimex Agon Light 2** retrocomputer, details its AT modem command interface, and provides an end-to-end guide for establishing and managing transparent TCP/IP communication over UART1.
+This document describes how the **MOD-WIFI-ESP8266** module interfaces with the **Agon family** (Agon Light, Agon Light 2, etc.) retrocomputers, details its AT modem command interface, and provides an end-to-end guide for establishing and managing transparent TCP/IP communication over UART1.
 
 ---
 
 ## 1. Hardware Architecture & Pinout
 
-The Agon Light 2 is powered by a Zilog eZ80F92 microcontroller running at 18.432 MHz. The eZ80 features two independent hardware UARTs:
+Agon family systems are powered by a Zilog eZ80 microcontroller (eZ80F92) running at 18.432 MHz. The eZ80 features two independent hardware UARTs:
 
 * **UART0:** Dedicated internally to the onboard ESP32 Video Display Processor (VDP), handling the monitor display, audio, keyboard input, and default MOS console at 115,200 baud.
 * **UART1:** Routed directly to the standard 10-pin **UEXT** expansion header.
@@ -19,14 +19,14 @@ The Olimex MOD-WIFI-ESP8266 plugs directly into this UEXT header without requiri
 * **Framing:** 8 data bits, no parity, 1 stop bit (8-N-1).
 * **Flow Control:** None (hardware RTS/CTS lines are not wired on the standard UEXT connector).
 * **eZ80 Pin Multiplexing:** `TXD1` and `RXD1` are multiplexed with Port D GPIO pins `PD4` and `PD5`. While MOS configures these at boot, custom operating system kernels or bare-metal code must ensure `PD_ALT1` and `PD_ALT2` enable the alternate function on Port D pins 4 and 5 to route signals to the UART1 hardware.
-* **Power Supply & Current Transients:** The ESP8266 power amplifier consumes transient current spikes between 250 mA and 300 mA during RF packet transmission. The Agon Light 2 host power source (typically USB) must supply at least 500 mA to 1 A of clean 5V DC to prevent 3.3V rail brownouts and CPU reset events during Wi-Fi bursts.
+* **Power Supply & Current Transients:** The ESP8266 power amplifier consumes transient current spikes between 250 mA and 300 mA during RF packet transmission. The Agon host power source (typically USB) must supply at least 500 mA to 1 A of clean 5V DC to prevent 3.3V rail brownouts and CPU reset events during Wi-Fi bursts.
 * **Data Integrity:** Because the physical wire uses 8-N-1 without hardware parity or flow control, higher-level block storage protocols (such as virtual disk transfers) should implement protocol-level checksums (such as CRC-16) to verify data integrity against electrical noise.
 
 ### UEXT Pin Mapping
 
 | UEXT Pin | Signal Name | ESP8266 Connection | Function / Description |
 | :--- | :--- | :--- | :--- |
-| **Pin 1** | `3.3V` | `VCC` | 3.3V DC power supplied by the Agon Light 2 |
+| **Pin 1** | `3.3V` | `VCC` | 3.3V DC power supplied by the Agon host |
 | **Pin 2** | `GND` | `GND` | Common ground |
 | **Pin 3** | `TXD1` | `RXD` | eZ80 UART1 Transmit (PD4) -> ESP8266 Receive (GPIO3) |
 | **Pin 4** | `RXD1` | `TXD` | eZ80 UART1 Receive (PD5) <- ESP8266 Transmit (GPIO1) |
@@ -216,7 +216,7 @@ The MOD-WIFI-ESP8266's ESP-AT firmware provides the complete command set necessa
 
 ## 5. Software Access, Buffering & Flow Control Architecture
 
-On the Agon Light 2, the eZ80 communicates with the MOD-WIFI-ESP8266 across the dedicated serial interface on UART1. Because the standard UEXT connector routes only TXD1 and RXD1 (3.3V TTL) without hardware flow control lines (RTS/CTS), serial communication relies entirely on hardware FIFOs, interrupt service routines, and multi-tier software buffers on both the host and the coprocessor.
+On the Agon family, the eZ80 communicates with the MOD-WIFI-ESP8266 across the dedicated serial interface on UART1. Because the standard UEXT connector routes only TXD1 and RXD1 (3.3V TTL) without hardware flow control lines (RTS/CTS), serial communication relies entirely on hardware FIFOs, interrupt service routines, and multi-tier software buffers on both the host and the coprocessor.
 
 ### A. Software Access Interfaces
 Software running on the eZ80 can interface with UART1 at two levels:
@@ -262,7 +262,7 @@ Legacy operating system drivers (such as the TRS-OS network client) were archite
 
 ## 6. End-to-End Operational Roadmap (UART1 TCP/IP Streaming)
 
-This roadmap outlines the complete lifecycle for establishing and managing a transparent TCP/IP communication stream between the Agon Light 2 and a remote server (e.g., FujiNet, DriveWire server, BBS, or custom file server) using UART1.
+This roadmap outlines the complete lifecycle for establishing and managing a transparent TCP/IP communication stream between the Agon family and a remote server (e.g., FujiNet, DriveWire server, BBS, or custom file server) using UART1.
 
 ### Operational Lifecycle Overview
 
