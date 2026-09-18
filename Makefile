@@ -1,5 +1,7 @@
 # ==============================================================================
 # Makefile - TRS-OS (TRSDOS 7) Build Automation for macOS
+# Target Platform: Olimex Agon Light 2 (Zilog eZ80F92 @ 18.432 MHz)
+# Peripheral     : Olimex MOD-WIFI-ESP8266 on 10-pin UEXT connector (UART1)
 # ==============================================================================
 
 SHELL        := /bin/bash
@@ -13,13 +15,18 @@ WINE         ?= wine64
 ZDS_DIR      ?= $(HOME)/.wine/drive_c/Zilog/ZDSII_eZ80Acclaim!_5.3.5
 AS           := $(WINE) "$(ZDS_DIR)/bin/ez80asm.exe"
 LD           := $(WINE) "$(ZDS_DIR)/bin/eZ80link.exe"
+HEX2BIN      ?= hex2bin
 
 CPU          ?= eZ80F91
 SRC_DIR      := TRSDOS_7
 GLOBAL_DIR   := TRSDOS_GLOBAL
+PATCH_DIR    := patches
+PATCHES      := $(sort $(wildcard $(PATCH_DIR)/*.patch))
+PATCH_STAMP  := $(SRC_DIR)/.patched
 TARGET_HEX   := $(SRC_DIR)/TRSDOS.hex
 TARGET_LOD   := $(SRC_DIR)/TRSDOS.lod
 TARGET_OBJ   := $(SRC_DIR)/TRSDOS.obj
+TARGET_BIN   := $(SRC_DIR)/TRSDOS.bin
 LINKCMD      := $(SRC_DIR)/TRSDOS_macos.linkcmd
 UPSTREAM_HEX := $(SRC_DIR)/debug/TRSDOS.hex
 
@@ -47,9 +54,9 @@ ASFLAGS      := -define:_EZ80ACCLAIM!=1 \
                 -list -listmac -name -pagelen:66 -pagewidth:132 \
                 -quiet -NOsdiopt -warn -debug -NOigcase -cpu:$(CPU)
 
-.PHONY: all fetch fetch-zds install-zds verify clean distclean check-env
+.PHONY: all fetch fetch-zds install-zds patch verify clean distclean check-env
 
-all: check-env $(SRC_DIR)/TRSDOS.s $(LINKCMD) $(TARGET_HEX)
+all: check-env $(SRC_DIR)/TRSDOS.s $(PATCH_STAMP) $(LINKCMD) $(TARGET_HEX) $(TARGET_BIN)
 
 # Verify environment prerequisites
 check-env:
@@ -58,6 +65,12 @@ check-env:
 		echo "Please install Apple's Game Porting Toolkit wine64:"; \
 		echo "  brew tap gcenx/wine"; \
 		echo "  brew install gcenx/wine/game-porting-toolkit"; \
+		exit 1; \
+	}
+	@command -v $(HEX2BIN) > /dev/null 2>&1 || { \
+		echo "Error: '$(HEX2BIN)' not found."; \
+		echo "Please install hex2bin via Homebrew:"; \
+		echo "  brew install hex2bin"; \
 		exit 1; \
 	}
 	@if [ ! -f "$(ZDS_DIR)/bin/ez80asm.exe" ]; then \
@@ -74,6 +87,19 @@ fetch $(SRC_DIR)/TRSDOS.s:
 	unzip -q -o TRSDOS_7.zip
 	rm -f TRSDOS_7.zip
 	@echo "==> TRS-OS source files unpacked successfully."
+
+# 1b. Apply patchset to fetched source tree
+patch: $(PATCH_STAMP)
+
+$(PATCH_STAMP): $(SRC_DIR)/TRSDOS.s $(PATCHES)
+	@if [ -n "$(PATCHES)" ]; then \
+		echo "==> Applying patchset from $(PATCH_DIR)..."; \
+		for p in $(PATCHES); do \
+			echo "    Applying $$p..."; \
+			patch -p1 -N -r - < "$$p" || exit 1; \
+		done; \
+	fi
+	@touch $@
 
 # 2. Fetch ZDS II installer from Zilog
 fetch-zds zds2_eZ80Acclaim!_5.3.5_23020901.zip:
@@ -106,7 +132,7 @@ $(LINKCMD): $(SRC_DIR)/debug/TRSDOS_Debug.linkcmd
 	sed 's|"C:\\.*\\TRSDOS"|"TRSDOS"|' $< > $@
 
 # 5. Assemble and link
-$(TARGET_OBJ): $(SRC_DIR)/TRSDOS.s
+$(TARGET_OBJ): $(SRC_DIR)/TRSDOS.s $(PATCH_STAMP)
 	@echo "==> Assembling TRSDOS.s with eZ80asm.exe..."
 	(cd $(SRC_DIR) && $(AS) $(ASFLAGS) TRSDOS.s)
 
@@ -115,15 +141,24 @@ $(TARGET_HEX) $(TARGET_LOD): $(TARGET_OBJ) $(LINKCMD)
 	(cd $(SRC_DIR) && $(LD) @$(notdir $(LINKCMD)))
 	@echo "==> Build successful: $(TARGET_HEX) generated."
 
+# 5b. Generate flat binary for OSboot loader
+$(TARGET_BIN): $(TARGET_HEX)
+	@echo "==> Generating flat binary $(TARGET_BIN) for OSboot..."
+	$(HEX2BIN) -s 000000 -p 00 "$<"
+	@echo "==> Build successful: $(TARGET_BIN) ($$(wc -c < $(TARGET_BIN) | tr -d ' ') bytes) ready for OSboot."
+
 # 6. Verify bit-for-bit against upstream release
 verify: all
 	@echo "==> Comparing built $(TARGET_HEX) against $(UPSTREAM_HEX)..."
-	@diff -u $(TARGET_HEX) $(UPSTREAM_HEX) && echo "==> Match! Output is 100% bit-for-bit identical to upstream."
+	@if [ -n "$(PATCHES)" ] && [ -f "$(PATCH_STAMP)" ]; then \
+		echo "Note: Patchset in $(PATCH_DIR) is applied; output includes custom modifications."; \
+	fi
+	@diff -u $(TARGET_HEX) $(UPSTREAM_HEX) && echo "==> Match! Output is 100% bit-for-bit identical to upstream." || true
 
 # 7. Clean build artifacts
 clean:
-	rm -f $(TARGET_OBJ) $(TARGET_HEX) $(TARGET_LOD) $(SRC_DIR)/TRSDOS.lst $(SRC_DIR)/TRSDOS.map $(LINKCMD)
+	rm -f $(TARGET_OBJ) $(TARGET_HEX) $(TARGET_LOD) $(TARGET_BIN) $(SRC_DIR)/TRSDOS.lst $(SRC_DIR)/TRSDOS.map $(LINKCMD)
 
-# 8. Complete reset: remove build artifacts, source tree, and PDFs (leaves only Makefile and README.md)
+# 8. Complete reset: remove build artifacts, source tree, and PDFs (leaves only Makefile, README.md, patches)
 distclean: clean
 	rm -rf $(SRC_DIR) $(GLOBAL_DIR) TRSDOS.pdf TRSDOS7_expanded_macros.pdf readme.txt

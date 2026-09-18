@@ -1,0 +1,338 @@
+Subject: [PATCH] Support UART1 TCP/IP streaming on Olimex Agon Light 2 (UEXT with MOD-WIFI-ESP8266)
+
+Target Hardware:
+- Microcontroller Host : Olimex Agon Light 2 (Zilog eZ80F92 @ 18.432 MHz)
+- Expansion Header     : 10-pin UEXT (Pin 3: TXD1/PC0, Pin 4: RXD1/PC1, 3.3V, GND)
+- Network Coprocessor  : Olimex MOD-WIFI-ESP8266 module (Espressif ESP-AT firmware)
+
+Hardware & Architecture Constraints:
+1. No Flow Control on UEXT:
+   The Olimex UEXT connector routes only TXD1 and RXD1 without RTS or CTS.
+   Upstream TRS-OS serial driver polled CTS in TXUART1 before every character,
+   stalling transmission indefinitely on UEXT. The patch removes this CTS test
+   and removes per-byte RTS toggling in RXUART1.
+
+2. 115,200 Baud on 18.432 MHz Clock:
+   The Olimex MOD-WIFI-ESP8266 operates at 115,200 baud by default. With the
+   Agon Light 2 crystal at 18.432 MHz, the exact BRG divisor is 10 (0x000A):
+       18,432,000 / (16 * 115,200) = 10 (0.00% baud error)
+   Upstream TRS-OS assumed 20 MHz or 50 MHz dev-kit clocks and 230,400 baud.
+
+3. Agon MOS Boot Handover via OSboot & Port C GPIO Multiplexing (eZ80F92):
+   Quark MOS boots TRS-OS via OSboot.bin with UART0_SPR = 3 (AGON platform).
+   The upstream kernel jumped past CPU/UART initialization on this path.
+   On the eZ80F92, UART1 is multiplexed onto Port C (PC0=TXD1, PC1=RXD1).
+   This patch configures Port C Mode 7 (Alternate Function: DDR=1, ALT1=0, ALT2=1
+   for PC0/PC1), sets the UART1 BRG divisor (10), disables UART1 interrupts via
+   UART1_IER (polling mode), adds a BRG warmup loop, and enables 16-byte FIFOs
+   in finish_init.
+
+4. Streaming Alignment & Interrupt Protection:
+   Transparent streaming mode (CIPMODE=1) transfers 260-byte sector blocks
+   continuously. Flushing the RX/TX FIFOs (07h -> UART1_FCTL) before commands
+   clears residual AT responses, and masking interrupts (DI/EI) during reads
+   prevents 60 Hz timer tasker routines from overflowing the 16-byte RX FIFO.
+
+5. Stack Balance & Error Handling in FDCDVR and Ping:
+   - In driver-FDCDVR.S (RDIN): Preserves the sector buffer address across
+     checksum calculation and retry loops (pop hl; push hl). On checksum match,
+     discards buffer address and jumps to rd_finish. On checksum failure, branches
+     to retry without stack drift.
+   - In driver-FDCDVR.S error handlers: Isolates call return addresses pushed by
+     IF_NE_GOSUB on timeout (fdc_rd_timeout, fdc_wr_timeout, fdc_wr_timeout1)
+     from jump-based retry-exhaustion paths (fdc_rd_err, fdc_wr_err), ensuring
+     the stack is cleanly balanced and caller registers (BC, HL) are restored.
+   - In ipl_net_ping.s: Isolates ping_timeout (which pops the 2-byte call address
+     from IF_NE_GOSUB) from no_pong, preventing stack corruption when CMP.bytes fails.
+
+--- patch_orig/TRSDOS_7/SYS0_IPL/ipl-eZ80_CPU.S
++++ patch_new/TRSDOS_7/SYS0_IPL/ipl-eZ80_CPU.S
+@@ -337,10 +337,10 @@
+ 
+ ;	Set baud rate generator. Baud rate is equated in eZ80.
+ 
+-		LD	A,LOW(f91_serialnet_baud)  	; LSB of BRG divisor
++		LD	A,LOW(f92_serialnet_baud)  	; LSB of BRG divisor (10 for 115200 baud @ 18.432 MHz on Agon Light 2)
+ 		OUT0	(UART1_BRG_L),A   		; load low byte of BRG.
+ 
+-		LD	A,HIGH(f91_serialnet_baud) 	; MSB of BRG divisor
++		LD	A,HIGH(f92_serialnet_baud) 	; MSB of BRG divisor
+ 		OUT0	(UART1_BRG_H),A   		; load high byte of BRG
+ 
+ 		LD	A,03h           		; select 8bits, no parity, 1 stop.
+@@ -428,7 +428,38 @@
+ 
+ ;		Initialization of CPU complete, splash first welcome/copyright screen.
+ 
+-finish_init	UART0.dtr.set				; Set DTR active tell other end we are powered on & ready.
++finish_init
++		; Olimex Agon Light 2 (eZ80F92): Configure Port C alternate functions for UART1 (PC0=TXD1, PC1=RXD1 on UEXT)
++		; Mode 7 (Alternate Function): DDR=1, ALT1=0, ALT2=1 for PC0 and PC1 (mask 03h)
++		IN0	A,(PC_DDR)
++		OR	00000011b
++		OUT0	(PC_DDR),A
++		IN0	A,(PC_ALT1)
++		AND	11111100b
++		OUT0	(PC_ALT1),A
++		IN0	A,(PC_ALT2)
++		OR	00000011b
++		OUT0	(PC_ALT2),A
++
++		; Initialize UART1 BRG (115200 baud @ 18.432 MHz) and FIFOs for Olimex MOD-WIFI-ESP8266
++		LD	A,83h				; Set bit 7 to enable UART BRG register access.
++		OUT0	(UART1_LCTL),A  		; enable access to BRG.
++		LD	A,LOW(f92_serialnet_baud)  	; LSB of BRG divisor (10 for 115200 baud @ 18.432 MHz)
++		OUT0	(UART1_BRG_L),A   		; load low byte of BRG.
++		LD	A,HIGH(f92_serialnet_baud) 	; MSB of BRG divisor
++		OUT0	(UART1_BRG_H),A   		; load high byte of BRG
++		LD	A,03h           		; select 8bits, no parity, 1 stop.
++		OUT0	(UART1_LCTL),A  		; and lock BRG.
++		XOR	A
++		OUT0	(UART1_IER),A			; Disable all UART1 interrupts (polling mode)
++		LD	B,0
++		DJNZ	$				; WARMUP, let BRG stabilize
++		LD	A,01h  				; Per Zilog manual, 1st set bit 0.
++		OUT0	(UART1_FCTL),A			; Then set bits 1 & 2..
++		LD	A,07h  				; Activate and clear receive and transmit FIFOs.
++		OUT0	(UART1_FCTL),A
++
++		UART0.dtr.set				; Set DTR active tell other end we are powered on & ready.
+ 		UART1.dtr.set				; Set DTR active tell other end we are powered on & ready.
+ 		ld	c,020h				; Get fill byte in accumulator.
+ 		ld	hl,CRTBGN$
+--- patch_orig/TRSDOS_7/SYS0_IPL/ipl_net_bind.s
++++ patch_new/TRSDOS_7/SYS0_IPL/ipl_net_bind.s
+@@ -16,13 +16,14 @@
+ 
+ 		PUMP	DEVICE.console,bind_screen$	; Tell operator this is bind program.
+ 		PUMP	DEVICE.console,bind_who$	; Report which vol to bind to server.
+-;		UART1.mctl.put	00000001b		; Set DTR active, RTS active tell we are ready.
++		ld	a,07h				; Flush UART1 RX/TX FIFOs before sending bind (MOD-WIFI-ESP8266 stream)
++		out0	(UART1_FCTL),a
+ 
+ 		PUMP	DEVICE.serialnet,bind_command$	; Send ping string to server @ping LF.asc.
+ 
+-get_bind_byte;	UART1.mctl.put	00000011b		; Set DTR active, RTS active tell we are ready.
++		di					; Protect streaming reception from 60 Hz timer IRQ
++get_bind_byte
+ 		UART1.get.byte	bind_timeout		; Get byte from UART1. On timeout or error goto no_pong.
+-	;	UART1.mctl.put	00000001b		; Set DTR active, RTS active tell we are ready.
+ 
+ 		ld	a,'@'				; Is 1st char @ control code?
+ 		cp	c				; Compare to C, C has char from GET_BYTE_UART1.
+@@ -35,6 +36,7 @@
+ 		PUMP	DEVICE.console,bind_reply_rx$	; Report received @bound from server.
+ 
+ 		UART1.get.bytes 0,bind_buffer,bind_timeout ; Place 256 bytes in buffer & vector on timeout.
++		ei					; Re-enable interrupts
+ 
+ 		get.DCT	6				; Get address of DCT #6 in IY.
+ 		ld	a,(jp_ins)
+@@ -43,7 +45,8 @@
+ bind_exit	ld	a,0ffh
+ bind_ret	RETURN
+ 
+-no_bind		MVC	server_not,server_stat,12	; Change server to show available.
++no_bind		ei					; Re-enable interrupts on error
++		MVC	server_not,server_stat,12	; Change server to show available.
+ 		PUMP	DEVICE.console,bind_not_rec$	; Tell operator no reply recieved.
+ 		GOTO	bind_exit
+ 
+--- patch_orig/TRSDOS_7/SYS0_IPL/ipl_net_ping.s
++++ patch_new/TRSDOS_7/SYS0_IPL/ipl_net_ping.s
+@@ -9,28 +9,33 @@
+ 		PUMP	DEVICE.console,ping_screen$	; Tell operator this is ping program.
+ 		PUMP	DEVICE.console,ping_da_ping$	; Report pinging server.
+ 
+-;		UART1.dtr.set				; Turn UART 1 DTR ON.
+-;		UART1.rts.set
++		ld	a,07h				; Flush UART1 RX/TX FIFOs before sending ping (MOD-WIFI-ESP8266 stream)
++		out0	(UART1_FCTL),a
++
+ 		PUMP	DEVICE.serialnet,ping_string$	; Send ping string to server @ping LF.asc.
+-;		UART1.rts.reset
+ 
+ 		PUMP	DEVICE.console,ping_sent$	; Report starting ping to server.
+ 
+-test_reply	UART1.get.byte	no_pong			; Get byte from UART1. On timeout or error goto no_pong.
++		di					; Protect streaming reception from 60 Hz timer IRQ
++test_reply	UART1.get.byte	ping_timeout		; Get byte from UART1. On timeout or error goto ping_timeout.
+ 		ld	a,'@'				; Is 1st char @ control code?
+ 		cp	c				; Compare to C, C has char from GET_BYTE_UART1.
+ 		JR     	NZ,test_reply			; Ignore if not control char & continue getting chars.
+ 
+ ;		UART1.rts.set
+-		UART1.get.bytes	5,pong_buff+1,no_pong	; get 5 bytes into pong_buff, if timout or error goto no pong.
++		UART1.get.bytes	5,pong_buff+1,ping_timeout ; get 5 bytes into pong_buff, if timeout goto ping_timeout.
+ ;		UART1.rts.reset
++		ei					; Re-enable interrupts
+ 
+-		CMP.bytes 6,pong$,pong_buff,no_pong	; Compare 'pong' to pong_buffer. If <> goto no_pong.
++		CMP.bytes 6,pong$,pong_buff,no_pong	; Compare 'pong' to pong_buffer. If <> goto no_pong (no call on stack).
+ 		MVC	server_avail,server_stat,12	; Change server to show available.
+ 		PUMP	DEVICE.console,reply_rx$	; Report received @pong from server.
+ 		GOTO	ping_exit
+ 
+-no_pong		pop	hl				; Discard error trap address.
++ping_timeout	pop	hl				; Discard return address from IF_NE_GOSUB call.
++		GOTO	no_pong
++
++no_pong		ei					; Re-enable interrupts on error
+ 		MVC	server_not,server_stat,12	; Change server to show available.
+ 		PUMP	DEVICE.console,no_pong_rec$	; Tell operator no reply recieved.
+ 
+--- patch_orig/TRSDOS_7/SYSRES/drivers/driver-FDCDVR.S
++++ patch_new/TRSDOS_7/SYSRES/drivers/driver-FDCDVR.S
+@@ -164,27 +164,33 @@
+ 		HEXDEC	(fdc_no_sum),net_cmd+1		; Convert 16 bit address to ascii in network command.
+ 		ZEROS_RPL_SPACE	net_cmd+1		; Convert leading spaces in buffer to 0's.
+ 
++		ld	a,07h				; Flush UART1 RX/TX FIFOs before request (Olimex MOD-WIFI-ESP8266 stream)
++		out0	(UART1_FCTL),a
++
+ 		PUMP	DEVICE.serialnet,net_cmd 	; Send <XXXXX LF.asc packet.
+ 
+ 		pop	hl				; Recover destination buffer address.
+ 		push	hl				; Save again for checksum routine.
+ 
+-		UART1.get.bytes	0,hl,fdc_rd_err	 	; Get from server 256 byte sector requested.
+-		UART1.get.bytes	4,chk_sum,fdc_rd_err	; Get from server 4 byte checksum.
++		UART1.get.bytes	0,hl,fdc_rd_timeout 	; Get from server 256 byte sector requested.
++		UART1.get.bytes	4,chk_sum,fdc_rd_timeout ; Get from server 4 byte checksum.
+ 
+ 		pop	hl				; Get pointer to buffer.
++		push	hl				; Keep buffer address on stack for potential retry.
+ 		GOSUB	calc_cksum
+ 		ld	b,a
+ 		ld	a,(chk_sum+3)
+ 		cp	b
+-		IF_EQ_GOTO rd_finish
++		IF_NE_GOTO rd_retry_cksum		; Checksum mismatch -> retry
++		pop	hl				; Discard buffer address
++		GOTO	rd_finish			; Checksum valid -> finish
+ 
+ ; Here we have a error on read.
+ ; Bump retry counter.
+ ; Set server command to retry.
+ ; If retries does not roll over to 0 go around again.
+ 
+-		ld	hl,rd_retries
++rd_retry_cksum	ld	hl,rd_retries
+ 		inc	(hl)				; Bump counter by 1.
+ 		IF_EQ_GOTO	fdc_rd_err		; If counter rolls over to 0 we have 256 retries, abort i/o.
+ 		ld	a,'\'				; Retry signal to server.
+@@ -251,12 +257,15 @@
+ 		LD	a,'>'
+ wr_retry	ld	(net_cmd),a			; Stuff direction in command buffer.
+ 
++		ld	a,07h				; Flush UART1 RX/TX FIFOs before request (Olimex MOD-WIFI-ESP8266 stream)
++		out0	(UART1_FCTL),a
++
+ 		PUMP	DEVICE.serialnet,net_cmd 	; Send @<XXXXX LF.asc packet.
+ 
+ 		pop	hl				; Recover buffer address for read.
+ 		push	hl				; Leaving one copy on stack.
+ 
+-		UART1.put.bytes	0,hl,fdc_wr_err 	; Write to server 256 byte sector.
++		UART1.put.bytes	0,hl,fdc_wr_timeout 	; Write to server 256 byte sector.
+ 		
+ 		pop	hl				; Get buffer address.
+ 		push	hl				; Leaving one copy on stack.
+@@ -264,9 +273,9 @@
+ 		ld	(chk_sum+3),a			; Store these 8 bits in little endian of 32 bit python int.
+ 		push	af				; Save checksum for now.
+ 
+-		UART1.put.bytes	4,chk_sum,fdc_wr_err1	; Send server 4 byte int containing checksum.
+-
+-		UART1.get.bytes	4,chk_sum,fdc_wr_err1	; Get 4 byte checksum returning from server.
++		UART1.put.bytes	4,chk_sum,fdc_wr_timeout1 ; Send server 4 byte int containing checksum.
++
++		UART1.get.bytes	4,chk_sum,fdc_wr_timeout1 ; Get 4 byte checksum returning from server.
+ 
+ 		pop	bc				; Recover original checksum, B will have old A.
+ 		ld	a,(chk_sum+3)			; Compare round trip checksum in buffer to original.
+@@ -354,16 +363,23 @@
+ 		LD	(PADDRESS+1),hl
+ 		ret
+ 
+-fdc_rd_err	pop	hl				; Discard return address.
+-		pop	hl				; Discard return address.
++fdc_rd_timeout	pop	hl				; Discard return address from IF_NE_GOSUB call.
++fdc_rd_err	pop	hl				; Discard buffer address.
++		pop	de				; Discard track/sector.
++		pop	bc				; Recover entry BC.
++		pop	hl				; Recover entry HL.
+ 		ld	a,03h				; Data lost on read.
+ 		or	a				; Make NZ, error.
+ 		ei
+ 		RETURN
+ 	
+-fdc_wr_err1	pop	hl				; Discard extra data.
+-fdc_wr_err	pop	hl				; Buffer address.
+-		pop	de				; This vector used for cleanup of 1 extra item on stack.
++fdc_wr_timeout1	pop	hl				; Discard return address from IF_NE_GOSUB call.
++		pop	af				; Discard saved checksum from line 271.
++		jr	fdc_wr_err
++
++fdc_wr_timeout	pop	hl				; Discard return address from IF_NE_GOSUB call.
++fdc_wr_err	pop	hl				; Discard buffer address.
++		pop	de				; Discard track/sector.
+ 		pop	bc				; Recovered from save on entry to driver.
+ 		POP	HL				; Per Soltoff we restore on exit any registers we used.
+ 		ld	a,14				; Write fault on disk drive.
+--- patch_orig/TRSDOS_7/SYSRES/drivers/driver-UART1.S
++++ patch_new/TRSDOS_7/SYSRES/drivers/driver-UART1.S
+@@ -31,13 +31,13 @@
+ 		ld	de,0			; Inits for 65536 countdown.
+ 
+ 		UART1.dtr.set			; Set DTR active, tell server we are here.
+-		UART1.rts.set			; Set RTS active tell we are ready.
++;		UART1.rts.set			; Olimex Agon Light 2 UEXT has no RTS line connected (TXD1/RXD1 only).
+ 
+ RXUART1WAIT	call	uart1_timeout		; Call timeout timer, if counter reaches 0 no return.
+ 
+ 		UART1.tst.rx	RXUART1WAIT	; loop until byte avail.
+ 
+-		UART1.rts.reset			; Set RTS inactive telling other end wait.
++;		UART1.rts.reset			; Olimex Agon Light 2 UEXT has no RTS line connected (TXD1/RXD1 only).
+ 
+ 		IN0	c,(UART1_RBR)		; GET char waiting.
+ 
+@@ -55,7 +55,7 @@
+ 
+ TXUART1WAIT	call	uart1_timeout		; Call timeout timer. If this counter has reached 0 there is no return.
+ 
+-		UART1.tst.cts	TXUART1WAIT	; Test if UART CTS ready? If <> ready wait in loop, calling timeout timer.
++;		UART1.tst.cts	TXUART1WAIT	; Olimex Agon Light 2 UEXT has no CTS line connected (TXD1/RXD1 only).
+ 
+ 		UART1.tst.tx	TXUART1WAIT	; Test if UART1 xmitter empty & ready accept data.
+  
+@@ -79,7 +79,7 @@
+ 		or	a			; Make NZ.
+ 		RETURN				; Return with error.
+ 
+-echo_delay_ct	equ	25			; Single source to change delay for assembly.
++echo_delay_ct	equ	60			; Delay counter (~4s for Wi-Fi / TCP latency on Olimex MOD-WIFI-ESP8266).
+ echo_timer	db	echo_delay_ct		; Holds counter when running timer for timeout detection.
+ 
+ U1END:		EQU	$-1			
+--- patch_orig/TRSDOS_GLOBAL/equates/equates-versions.s
++++ patch_new/TRSDOS_GLOBAL/equates/equates-versions.s
+@@ -11,13 +11,13 @@
+ 
+ 
+ DEVICE.console.baud	EQU	230400	; Starting console baudrate.
+-DEVICE.serialnet.baud	EQU	230400	; Starting UART1 baudrate.
++DEVICE.serialnet.baud	EQU	115200	; Starting UART1 baudrate (Olimex MOD-WIFI-ESP8266 default).	; Starting UART1 baudrate.
+ 
+ f91_console_baud	EQU 	((_SYS_CLK_FREQ / DEVICE.console.baud) /16)	; Default baud rate for f91.
+-f92_console_baud	EQU 	((20000000 / DEVICE.console.baud) /16)		; Default baud rate for f92.
++f92_console_baud	EQU 	((18432000 / DEVICE.console.baud) /16)		; Default baud rate for f92 (Olimex Agon Light 2 18.432 MHz).		; Default baud rate for f92.
+ 
+-f91_serialnet_baud	EQU 	((_SYS_CLK_FREQ / DEVICE.serialnet.baud) /16)	; Default baud rate for f91.
+-f92_serialnet_baud	EQU 	((20000000 / DEVICE.serialnet.baud) /16)	; Default baud rate for f92.
++f91_serialnet_baud	EQU 	((18432000 / DEVICE.serialnet.baud) /16)	; Default baud rate for f91 on Agon Light 2.	; Default baud rate for f91.
++f92_serialnet_baud	EQU 	((18432000 / DEVICE.serialnet.baud) /16)	; Default baud rate for f92 on Agon Light 2.	; Default baud rate for f92.
+ 
+ ; < Systems terminal refresh updates. >
+ 
