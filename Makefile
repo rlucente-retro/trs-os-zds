@@ -6,8 +6,9 @@
 
 SHELL        := /bin/bash
 
-# URLs
+# URLs & Archives
 TRSDOS_URL   := https://www.danielpaulmartin.com/sitepad-data/uploads/TRSDOS_7.zip
+TRSDOS_ZIP   ?= TRSDOS_7.zip
 ZILOG_URL    := https://www.zilog.com/index.php?option=com_zcm&task=view&soft_id=54&Itemid=74
 
 # Tools & Wine paths
@@ -79,13 +80,18 @@ check-env:
 		$(MAKE) install-zds; \
 	fi
 
-# 1. Fetch and unpack TRS-OS source tree from Daniel Paul Martin's site
+# 1. Fetch and unpack TRS-OS source tree
 fetch $(SRC_DIR)/TRSDOS.s:
-	@echo "==> Fetching TRSDOS_7.zip from $(TRSDOS_URL)..."
-	curl -s -L -o TRSDOS_7.zip "$(TRSDOS_URL)"
-	@echo "==> Unpacking TRSDOS_7.zip..."
-	unzip -q -o TRSDOS_7.zip
-	rm -f TRSDOS_7.zip
+	@if [ -f "$(TRSDOS_ZIP)" ]; then \
+		echo "==> Using local $(TRSDOS_ZIP)..."; \
+		unzip -q -o "$(TRSDOS_ZIP)"; \
+	else \
+		echo "==> Fetching $(TRSDOS_ZIP) from $(TRSDOS_URL)..."; \
+		curl -s -L -o "$(TRSDOS_ZIP)" "$(TRSDOS_URL)"; \
+		echo "==> Unpacking $(TRSDOS_ZIP)..."; \
+		unzip -q -o "$(TRSDOS_ZIP)"; \
+		rm -f "$(TRSDOS_ZIP)"; \
+	fi
 	@echo "==> TRS-OS source files unpacked successfully."
 
 # 1b. Apply patchset to fetched source tree
