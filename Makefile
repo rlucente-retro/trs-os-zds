@@ -9,6 +9,8 @@ SHELL        := /bin/bash
 # URLs & Archives
 TRSDOS_URL   := https://www.danielpaulmartin.com/sitepad-data/uploads/TRSDOS_7.zip
 TRSDOS_ZIP   ?= TRSDOS_7.zip
+TRSNET_URL   := https://danielpaulmartin.com/sitepad-data/uploads/TRS-NET.zip
+TRSNET_ZIP   ?= TRS-NET.zip
 ZILOG_URL    := https://www.zilog.com/index.php?option=com_zcm&task=view&soft_id=54&Itemid=74
 
 # Tools & Wine paths
@@ -28,6 +30,8 @@ TARGET_HEX   := $(SRC_DIR)/TRSDOS.hex
 TARGET_LOD   := $(SRC_DIR)/TRSDOS.lod
 TARGET_OBJ   := $(SRC_DIR)/TRSDOS.obj
 TARGET_BIN   := $(SRC_DIR)/TRSDOS.bin
+TARGET_STAGE := $(SRC_DIR)/TRSDOS_kernel.bin
+BOOT_DSK     := $(SRC_DIR)/boot_volume.dsk
 LINKCMD      := $(SRC_DIR)/TRSDOS_macos.linkcmd
 UPSTREAM_HEX := $(SRC_DIR)/debug/TRSDOS.hex
 
@@ -55,9 +59,9 @@ ASFLAGS      := -define:_EZ80ACCLAIM!=1 \
                 -list -listmac -name -pagelen:66 -pagewidth:132 \
                 -quiet -NOsdiopt -warn -debug -NOigcase -cpu:$(CPU)
 
-.PHONY: all fetch fetch-zds install-zds patch verify clean distclean check-env
+.PHONY: all fetch fetch-boot fetch-zds install-zds patch verify clean distclean check-env check-wine
 
-all: check-env $(SRC_DIR)/TRSDOS.s $(PATCH_STAMP) $(LINKCMD) $(TARGET_HEX) $(TARGET_BIN)
+all: check-env $(SRC_DIR)/TRSDOS.s $(BOOT_DSK) $(PATCH_STAMP) $(LINKCMD) $(TARGET_HEX) $(TARGET_BIN)
 
 # Verify environment prerequisites
 check-env:
@@ -81,7 +85,9 @@ check-env:
 	fi
 
 # 1. Fetch and unpack TRS-OS source tree
-fetch $(SRC_DIR)/TRSDOS.s:
+fetch: $(SRC_DIR)/TRSDOS.s $(BOOT_DSK)
+
+$(SRC_DIR)/TRSDOS.s:
 	@if [ -f "$(TRSDOS_ZIP)" ]; then \
 		echo "==> Using local $(TRSDOS_ZIP)..."; \
 		unzip -q -o "$(TRSDOS_ZIP)"; \
@@ -94,7 +100,35 @@ fetch $(SRC_DIR)/TRSDOS.s:
 	fi
 	@echo "==> TRS-OS source files unpacked successfully."
 
-# 1b. Apply patchset to fetched source tree
+# 1b. Fetch and extract boot volume (DiskDISK Volume 0)
+fetch-boot: $(BOOT_DSK)
+
+$(BOOT_DSK): extract_boot_volume.py
+	@if [ -f "$(BOOT_DSK)" ]; then \
+		echo "==> Using existing $(BOOT_DSK)..."; \
+	elif [ -f "boot_volume.dsk" ]; then \
+		echo "==> Using local boot_volume.dsk..."; \
+		mkdir -p $(SRC_DIR); \
+		cp -f "boot_volume.dsk" "$@"; \
+	elif [ -f "TRS-OS_Squirrel.bin" ]; then \
+		echo "==> Extracting boot volume from local TRS-OS_Squirrel.bin..."; \
+		python3 extract_boot_volume.py "TRS-OS_Squirrel.bin" "$@"; \
+	elif [ -f "$(TRSNET_ZIP)" ]; then \
+		echo "==> Extracting boot volume from local $(TRSNET_ZIP)..."; \
+		unzip -q -o "$(TRSNET_ZIP)" "TRS-OS_Squirrel.bin" -d /tmp; \
+		python3 extract_boot_volume.py "/tmp/TRS-OS_Squirrel.bin" "$@"; \
+		rm -f "/tmp/TRS-OS_Squirrel.bin"; \
+	else \
+		echo "==> Fetching $(TRSNET_ZIP) from $(TRSNET_URL)..."; \
+		curl -s -L -o "$(TRSNET_ZIP)" "$(TRSNET_URL)"; \
+		echo "==> Extracting boot volume from $(TRSNET_ZIP)..."; \
+		unzip -q -o "$(TRSNET_ZIP)" "TRS-OS_Squirrel.bin" -d /tmp; \
+		python3 extract_boot_volume.py "/tmp/TRS-OS_Squirrel.bin" "$@"; \
+		rm -f "/tmp/TRS-OS_Squirrel.bin" "$(TRSNET_ZIP)"; \
+	fi
+	@echo "==> Boot volume ready at $@ ($$(wc -c < "$@" | tr -d ' ') bytes)."
+
+# 1c. Apply patchset to fetched source tree
 patch: $(PATCH_STAMP)
 
 $(PATCH_STAMP): $(SRC_DIR)/TRSDOS.s $(PATCHES)
@@ -108,13 +142,15 @@ $(PATCH_STAMP): $(SRC_DIR)/TRSDOS.s $(PATCHES)
 	@touch $@
 
 # 2. Fetch ZDS II installer from Zilog
-fetch-zds zds2_eZ80Acclaim!_5.3.5_23020901.zip:
+fetch-zds: zds2_eZ80Acclaim!_5.3.5_23020901.zip
+
+zds2_eZ80Acclaim!_5.3.5_23020901.zip:
 	@echo "==> Fetching ZDS II installer from Zilog..."
 	curl -s -L -X POST \
 		-d "software_id=54&software_name=ZDS+II+-+eZ80Acclaim%21+version+5.3.5+with+RZK+and+TCP%2FIP+2.5.1+Object+Code&random_id=375" \
 		"$(ZILOG_URL)" \
-		-o zds2_eZ80Acclaim!_5.3.5_23020901.zip
-	@echo "==> Downloaded zds2_eZ80Acclaim!_5.3.5_23020901.zip successfully."
+		-o "$@"
+	@echo "==> Downloaded $@ successfully."
 
 # 3. Silently install ZDS II into Wine prefix
 install-zds: check-wine zds2_eZ80Acclaim!_5.3.5_23020901.zip
@@ -147,10 +183,13 @@ $(TARGET_HEX) $(TARGET_LOD): $(TARGET_OBJ) $(LINKCMD)
 	(cd $(SRC_DIR) && $(LD) @$(notdir $(LINKCMD)))
 	@echo "==> Build successful: $(TARGET_HEX) generated."
 
-# 5b. Generate flat binary for OSboot loader
-$(TARGET_BIN): $(TARGET_HEX)
-	@echo "==> Generating flat binary $(TARGET_BIN) for OSboot..."
+# 5b. Generate flat binary for OSboot loader (bundled with boot volume)
+$(TARGET_BIN): $(TARGET_HEX) $(BOOT_DSK)
+	@echo "==> Generating flat kernel binary from $(TARGET_HEX)..."
 	$(HEX2BIN) -s 000000 -p 00 "$<"
+	@mv -f "$@" "$(TARGET_STAGE)"
+	@echo "==> Bundling kernel with boot volume into $(TARGET_BIN)..."
+	cat "$(TARGET_STAGE)" "$(BOOT_DSK)" > "$@"
 	@echo "==> Build successful: $(TARGET_BIN) ($$(wc -c < $(TARGET_BIN) | tr -d ' ') bytes) ready for OSboot."
 
 # 6. Verify bit-for-bit against upstream release
@@ -163,7 +202,7 @@ verify: all
 
 # 7. Clean build artifacts
 clean:
-	rm -f $(TARGET_OBJ) $(TARGET_HEX) $(TARGET_LOD) $(TARGET_BIN) $(SRC_DIR)/TRSDOS.lst $(SRC_DIR)/TRSDOS.map $(LINKCMD)
+	rm -f $(TARGET_OBJ) $(TARGET_HEX) $(TARGET_LOD) $(TARGET_BIN) $(TARGET_STAGE) $(SRC_DIR)/TRSDOS.lst $(SRC_DIR)/TRSDOS.map $(LINKCMD)
 
 # 8. Complete reset: remove build artifacts, source tree, and PDFs (leaves only Makefile, README.md, patches)
 distclean: clean

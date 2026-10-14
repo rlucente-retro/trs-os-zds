@@ -228,14 +228,17 @@ make distclean
 
 | Target | Description |
 | :--- | :--- |
-| `make` / `make all` | Default. Downloads sources/tools, applies `patches/*.patch`, builds `TRSDOS_7/TRSDOS.hex`, and generates `TRSDOS_7/TRSDOS.bin` for `OSboot`. |
-| `make patch` | Applies the patchset from `patches/` to the unpacked source tree (stamped via `TRSDOS_7/.patched`). |
-| `make verify` | Compiles the system and compares `TRSDOS.hex` against the upstream reference `debug/TRSDOS.hex`. |
-| `make fetch` | Downloads and unpacks `TRSDOS_7.zip` from Daniel Paul Martin's site. |
-| `make fetch-zds` | Downloads the ZDS II installer archive from Zilog. |
-| `make install-zds` | Silently installs ZDS II into `~/.wine/drive_c/Zilog/` using `wine64`. |
-| `make clean` | Removes object files, listing files, maps, and generated binaries (`.hex` and `.bin`). |
-| `make distclean` | Removes all downloaded source archives, unpacked directories, and PDFs. |
+| `make` / `make all` | Default target. Verifies host tools (`check-env`), fetches upstream source (`TRSDOS_7.zip`) and boot volume (`boot_volume.dsk`), applies `patches/*.patch`, assembles and links `TRSDOS_7/TRSDOS.hex`, and bundles the kernel with the boot volume into `TRSDOS_7/TRSDOS.bin` (491,520 bytes) for `OSboot`. |
+| `make check-env` | Verifies that required host utilities (`wine64`, `hex2bin`) are present on `$PATH`, and triggers `make install-zds` if the ZDS II toolchain is not found. |
+| `make check-wine` | Verifies that `wine64` (Apple Game Porting Toolkit / Wine) is installed on the host system. |
+| `make fetch` | Downloads and unpacks both the upstream `TRSDOS_7.zip` source archive and the `boot_volume.dsk` boot volume. |
+| `make fetch-boot` | Fetches `TRS-NET.zip` (or extracts from local `TRS-OS_Squirrel.bin` / `boot_volume.dsk`) and slices the 425,472-byte Misosys `DiskDISK` image into `TRSDOS_7/boot_volume.dsk`. |
+| `make fetch-zds` | Downloads the official ZDS II 5.3.5 installer archive (`zds2_eZ80Acclaim!_5.3.5_23020901.zip`) from Zilog. |
+| `make install-zds` | Silently installs the ZDS II compiler and linker into the Wine prefix (`~/.wine/drive_c/Zilog/`) using `wine64`. |
+| `make patch` | Applies the architecture patchset from `patches/` to the unpacked source tree (stamped via `TRSDOS_7/.patched`). |
+| `make verify` | Compiles the operating system and compares `TRSDOS_7/TRSDOS.hex` against the upstream reference binary `debug/TRSDOS.hex`. |
+| `make clean` | Removes intermediate object files, listing files, maps, linker scripts, kernel stage binary (`TRSDOS_kernel.bin`), and compiled binaries (`.hex`, `.lod`, `.bin`). Leaves patched sources and boot volume intact. |
+| `make distclean` | Complete reset: removes all build artifacts, downloaded archives (`*.zip`), unpacked source directories (`TRSDOS_7/`, `TRSDOS_GLOBAL/`), and documentation PDFs. Leaves only `Makefile`, `README.md`, `patches/`, and extraction scripts. |
 
 ---
 

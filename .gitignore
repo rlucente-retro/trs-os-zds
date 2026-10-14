@@ -6,6 +6,8 @@ readme.txt
 
 # Downloaded archives
 *.zip
+TRS-OS_Squirrel.bin
+boot_volume.dsk
 
 # OS metadata
 .DS_Store
