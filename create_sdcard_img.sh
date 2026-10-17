@@ -7,7 +7,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_EMU_DIR="$SCRIPT_DIR/../fab-agon-emulator-v1.2.4-macos-arm64"
+DEFAULT_EMU_DIR="$SCRIPT_DIR/../fab-agon-emulator-v1.2.6-macos-arm64"
 
 SRC_DIR="${1:-$DEFAULT_EMU_DIR/sdcard}"
 IMG_PATH="${2:-$DEFAULT_EMU_DIR/sdcard.img}"
