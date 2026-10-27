@@ -6,9 +6,10 @@ Phase 1 Deliverables:
 - Implement dw_offset table supporting DiskDISK (+1 sector offset) and JV1 (+0 offset) images
 - Enforce Stage 1 read-only write protection (R_PROTECTED / Error 15) in DOWRIT
 - Replace in-memory slice scanning in ipl-BIOS.s with direct DriveWire network boot of Drive :0
+- Route ipl-DOS.S auto-boot directly into default TRSDOS IPL (TRSDOS Ready prompt)
 
---- a/TRSDOS_GLOBAL/equates/equates-global-lowcore.s
-+++ b/TRSDOS_GLOBAL/equates/equates-global-lowcore.s
+--- TRSDOS_GLOBAL/equates/equates-global-lowcore.s	2026-01-09 11:12:22
++++ TRSDOS_GLOBAL/equates/equates-global-lowcore.s	2026-10-26 20:23:37
 @@ -216,6 +216,12 @@
  	XDEF		ramdrv$
  	XDEF		reboot
@@ -22,9 +23,9 @@ Phase 1 Deliverables:
  
  ; eZ80 associated xdef's.
  
---- a/TRSDOS_7/SYSRES/drivers/driver-FDCDVR.S
-+++ b/TRSDOS_7/SYSRES/drivers/driver-FDCDVR.S
-@@ -31,12 +31,18 @@
+--- TRSDOS_7/SYSRES/drivers/driver-FDCDVR.S	2026-10-13 20:01:22
++++ TRSDOS_7/SYSRES/drivers/driver-FDCDVR.S	2026-10-26 20:48:10
+@@ -31,7 +31,13 @@
  rd_retries	db	0
  wr_retries	db	0
  
@@ -38,22 +39,7 @@ Phase 1 Deliverables:
  ;       Disk Driver Entry Point
  ; ____________________________________
  
- FDCBGN		di
--		ld	(IY+5),d			; Update current track.
-+	;	ld	(IY+5),d			; Update current track.
- 
- 		ld	a,c				; Get drive requested code.
- 		ld	(LDRV$),a			; Store in current logical drive.
-@@ -116,7 +122,7 @@
- 		ei
- 		RET					; We are solid state drive, were always ready.	
- 
--SEEKTRK		LD	(IY+5),D			; Update current cylinder
-+SEEKTRK	;	LD	(IY+5),D			; Update current cylinder
- 		JR	TSTBSY
- 
- STPIN		DEC	(iy+5)				; FUNCTION 5 STEP-IN.
-@@ -143,60 +149,64 @@
+@@ -143,54 +149,64 @@
  
  		call	calcsec				; Calculate address of sector to read.
  
@@ -95,28 +81,23 @@ Phase 1 Deliverables:
  
 -		LD	a,'<'				; Symbol used for READ command.
 -read_retry	ld	(net_cmd),a			; Stuff direction in command buffer.
--
--		HEXDEC	(fdc_no_sum),net_cmd+1		; Convert 16 bit address to ascii in network command.
--		ZEROS_RPL_SPACE	net_cmd+1		; Convert leading spaces in buffer to 0's.
--
--		ld	a,07h				; Flush UART1 RX/TX FIFOs before request (Olimex MOD-WIFI-ESP8266 stream)
 +		; Flush UART1 RX/TX FIFOs before request
 +		ld	a,07h
- 		out0	(UART1_FCTL),a
++		out0	(UART1_FCTL),a
  
--		PUMP	DEVICE.serialnet,net_cmd 	; Send <XXXXX LF.asc packet.
+-		HEXDEC	(fdc_no_sum),net_cmd+1		; Convert 16 bit address to ascii in network command.
+-		ZEROS_RPL_SPACE	net_cmd+1		; Convert leading spaces in buffer to 0's.
 +		; Transmit 5-byte request header over UART1
 +		UART1.put.bytes 5,dw_hdr,fdc_rd_timeout
  
--		pop	hl				; Recover destination buffer address.
--		push	hl				; Save again for checksum routine.
+-		PUMP	DEVICE.serialnet,net_cmd 	; Send <XXXXX LF.asc packet.
 +		; Receive 256-byte sector data directly into target buffer
 +		pop	hl				; Recover user destination buffer pointer
 +		push	hl				; Save for checksum
 +		UART1.get.bytes 0,hl,fdc_rd_timeout	; Length 0 = 256 bytes
  
--		UART1.get.bytes	0,hl,fdc_rd_timeout 	; Get from server 256 byte sector requested.
--		UART1.get.bytes	4,chk_sum,fdc_rd_timeout ; Get from server 4 byte checksum.
+-		pop	hl				; Recover destination buffer address.
+-		push	hl				; Save again for checksum routine.
 +		; Calculate 16-bit big-endian unsigned checksum
 +		pop	hl				; Recover buffer pointer
 +		push	hl				; Keep on stack for rd_finish
@@ -126,41 +107,41 @@ Phase 1 Deliverables:
 +		ld	a,e
 +		ld	(dw_chk+1),a
  
+-		UART1.get.bytes	0,hl,fdc_rd_err	 	; Get from server 256 byte sector requested.
+-		UART1.get.bytes	4,chk_sum,fdc_rd_err	; Get from server 4 byte checksum.
++		; Transmit 2-byte checksum to server
++		UART1.put.bytes 2,dw_chk,fdc_rd_timeout
+ 
 -		pop	hl				; Get pointer to buffer.
--		push	hl				; Keep buffer address on stack for potential retry.
 -		GOSUB	calc_cksum
 -		ld	b,a
 -		ld	a,(chk_sum+3)
 -		cp	b
--		IF_NE_GOTO rd_retry_cksum		; Checksum mismatch -> retry
--		pop	hl				; Discard buffer address
--		GOTO	rd_finish			; Checksum valid -> finish
-+		; Transmit 2-byte checksum to server
-+		UART1.put.bytes 2,dw_chk,fdc_rd_timeout
- 
--; Here we have a error on read.
--; Bump retry counter.
--; Set server command to retry.
--; If retries does not roll over to 0 go around again.
+-		IF_EQ_GOTO rd_finish
 +		; Receive 1-byte status from server (0x00 = success)
 +		UART1.get.bytes 1,dw_status,fdc_rd_timeout
 +		ld	a,(dw_status)
 +		or	a
 +		jr	nz,fdc_rd_err
  
--rd_retry_cksum	ld	hl,rd_retries
+-; Here we have a error on read.
+-; Bump retry counter.
+-; Set server command to retry.
+-; If retries does not roll over to 0 go around again.
++		pop	hl				; Clean up buffer pointer from stack
++		jp	rd_finish			; Clean exit via authentic LS-DOS handler
+ 
+-		ld	hl,rd_retries
 -		inc	(hl)				; Bump counter by 1.
 -		IF_EQ_GOTO	fdc_rd_err		; If counter rolls over to 0 we have 256 retries, abort i/o.
 -		ld	a,'\'				; Retry signal to server.
 -		GOTO	read_retry
-+		pop	hl				; Clean up buffer pointer from stack
-+		jp	rd_finish			; Clean exit via authentic LS-DOS handler
- 
+-
 -
  rd_finish	POP	de				; Restore DE to track/sector.
  		ld	a,d				; Get track we just read.
  		cp	(IY+9)				; Compare directory track to track we just read.
-@@ -208,106 +218,15 @@
+@@ -202,103 +218,15 @@
  		ei
  		RETURN					; Return with NZ flag set indicating error.
  
@@ -187,16 +168,16 @@ Phase 1 Deliverables:
  		POP	HL				; Per Soltoff we restore on exit any registers we used.
 -		LD	A,15				; Error disk WP. Return with NZ & error code 15.
 -		ret					; Return with NZ & disk WP error in A.
--
--wp_ok		push	de				; D - contains track. E contains sector.						
--		PUSH	HL				; Save 16b pointer to buffer.
--			
--		call	calcsec				; Calculate address of sector to write.
 +		LD	A,15				; Error 15 = R_PROTECTED (Write Protected)
 +		or	a				; Set NZ for error
 +		ei
 +		RET
  
+-wp_ok		push	de				; D - contains track. E contains sector.						
+-		PUSH	HL				; Save 16b pointer to buffer.
+-			
+-		call	calcsec				; Calculate address of sector to write.
+-
 -		ld	a,(LDRV$)			; Is this i/o request a network drive?
 -		ld	b,a
 -		cp	6				; Drive 6 is reserved for network.
@@ -218,15 +199,12 @@ Phase 1 Deliverables:
 -		LD	a,'>'
 -wr_retry	ld	(net_cmd),a			; Stuff direction in command buffer.
 -
--		ld	a,07h				; Flush UART1 RX/TX FIFOs before request (Olimex MOD-WIFI-ESP8266 stream)
--		out0	(UART1_FCTL),a
--
 -		PUMP	DEVICE.serialnet,net_cmd 	; Send @<XXXXX LF.asc packet.
 -
 -		pop	hl				; Recover buffer address for read.
 -		push	hl				; Leaving one copy on stack.
 -
--		UART1.put.bytes	0,hl,fdc_wr_timeout 	; Write to server 256 byte sector.
+-		UART1.put.bytes	0,hl,fdc_wr_err 	; Write to server 256 byte sector.
 -		
 -		pop	hl				; Get buffer address.
 -		push	hl				; Leaving one copy on stack.
@@ -234,9 +212,9 @@ Phase 1 Deliverables:
 -		ld	(chk_sum+3),a			; Store these 8 bits in little endian of 32 bit python int.
 -		push	af				; Save checksum for now.
 -
--		UART1.put.bytes	4,chk_sum,fdc_wr_timeout1 ; Send server 4 byte int containing checksum.
+-		UART1.put.bytes	4,chk_sum,fdc_wr_err1	; Send server 4 byte int containing checksum.
 -
--		UART1.get.bytes	4,chk_sum,fdc_wr_timeout1 ; Get 4 byte checksum returning from server.
+-		UART1.get.bytes	4,chk_sum,fdc_wr_err1	; Get 4 byte checksum returning from server.
 -
 -		pop	bc				; Recover original checksum, B will have old A.
 -		ld	a,(chk_sum+3)			; Compare round trip checksum in buffer to original.
@@ -272,48 +250,36 @@ Phase 1 Deliverables:
  ; IY points do DCTx$
  ; D - contains track.
  ; E - contains sector.
-@@ -330,7 +249,7 @@
- ; 2nd calculate sectors per cylinder.
- ; D-contains track, E contains sector.
+@@ -373,16 +301,23 @@
+ 		LD	(PADDRESS+1),hl
+ 		ret
  
--FRCSID0		LD	hl,DE				; sector in lower 8 bits of HL.
-+FRCSID0		LD	l,E				; sector in lower 8 bits of HL.
- 		ld	h,0				; Zero upper 8 bits. HL now contains sector.
- 		LD	A,(IY+7)			; P/U sectors per track.
- 		AND	1Fh				; Mask out all but # SEC per TRK.
-@@ -344,10 +263,29 @@
- 
- stp23		LD	E,A				; Move # of SEC per CYL to E.
- 		MLT	DE				; we then multiply (# CYL * SEC per CYL) 16b result in DE.
--		add	hl,de				; Add in sector number we saved before.
- 
--		ld	(fdc_no_sum),hl	; Save sum w/o offset for net driver.
-+		bit	3,(iy+3)			; Is this a HD?
-+		jr	z,not_hd			; If no, not a HD.
- 
-+		bit	5,(iy+4)			; If HD is yes is DBLBIT set?
-+		jr	z,not_hd			; Nah...skip doubling.
+-fdc_rd_err	pop	hl				; Discard return address.
+-		pop	hl				; Discard return address.
++fdc_rd_timeout	pop	hl				; Discard return address from IF_NE_GOSUB call.
++fdc_rd_err	pop	hl				; Discard buffer address.
++		pop	de				; Discard track/sector.
++		pop	bc				; Recover entry BC.
++		pop	hl				; Recover entry HL.
+ 		ld	a,03h				; Data lost on read.
+ 		or	a				; Make NZ, error.
+ 		ei
+ 		RETURN
+ 	
+-fdc_wr_err1	pop	hl				; Discard extra data.
+-fdc_wr_err	pop	hl				; Buffer address.
+-		pop	de				; This vector used for cleanup of 1 extra item on stack.
++fdc_wr_timeout1	pop	hl				; Discard return address from IF_NE_GOSUB call.
++		pop	af				; Discard saved checksum from line 271.
++		jr	fdc_wr_err
 +
-+		ld	a,(iy+7)
-+		and	11100000b			; Strip out # of heads.
-+		sra	a
-+		sra	a
-+		sra	a
-+		sra	a
-+		sra	a				; Shift all bits # heads right, 4 heads = 3 or 011.
-+
-+keep_mpy	sla	e				; If yes double product.
-+		rl	d				; Shift overflow if any into d, thus DE=DE*2.
-+		sra	a
-+		jr	nz,keep_mpy			; Repeat until we multiply by 2 as many heads exist this partition.
-+
-+not_hd		add	hl,de				; Add in sector number we saved before.
-+		ld	(fdc_no_sum),hl			; Save sum w/o offset for net driver.
-+
- ; 4th, using upper 16 bits of RAM drive base address, add in offset using results of above calculation.
- ; Leave results in HL.
- ; RAMDRV$ below was populated at entry to driver by looking up using drive #.
-@@ -394,4 +332,16 @@
++fdc_wr_timeout	pop	hl				; Discard return address from IF_NE_GOSUB call.
++fdc_wr_err	pop	hl				; Discard buffer address.
++		pop	de				; Discard track/sector.
+ 		pop	bc				; Recovered from save on entry to driver.
+ 		POP	HL				; Per Soltoff we restore on exit any registers we used.
+ 		ld	a,14				; Write fault on disk drive.
+@@ -397,4 +332,16 @@
  		LOOP	calc_cksum+3
  		RETURN
  
@@ -331,8 +297,8 @@ Phase 1 Deliverables:
 +
  FDCEND:		EQU	$-1
 \ No newline at end of file
---- a/TRSDOS_7/SYS0_IPL/ipl-BIOS.s
-+++ b/TRSDOS_7/SYS0_IPL/ipl-BIOS.s
+--- TRSDOS_7/SYS0_IPL/ipl-BIOS.s	2026-01-17 18:00:42
++++ TRSDOS_7/SYS0_IPL/ipl-BIOS.s	2026-10-26 20:45:04
 @@ -41,101 +41,68 @@
  
  pastshawn	PUMP	DEVICE.console,splashiplmode	; Report CPU registers initialized.
@@ -778,3 +744,16 @@ Phase 1 Deliverables:
  
  ; Delay a bit and allow copyright splash to be read.
  
+--- TRSDOS_7/SYS0_IPL/ipl-DOS.S	2026-10-10 11:20:40
++++ TRSDOS_7/SYS0_IPL/ipl-DOS.S	2026-10-26 21:41:58
+@@ -76,9 +76,7 @@
+ 		call query_server		; Get server parameters.
+ 		call bind_server		; Bind server & client (me).
+ 
+-ipl_chk_quiet	ld	a,(quiet_default_flg)	; Get quiet/default IPL code.
+-		and	10000000b		; Isolate quiet flag.
+-		IF_NE_GOTO default_ipl	; Bypass if quiet off.
++ipl_chk_quiet	GOTO	default_ipl		; Auto-boot directly to default TRSDOS IPL
+ 
+ 
+ main_ipl_menu	DATE.get BERTSAYS+7		; Put current date in menu.
