@@ -1,0 +1,192 @@
+Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and boot loops
+
+1. driver-uart0.s:
+   - Add VDP binary packet decoder: filters out VDP metadata packets (0x86
+     PACKET_MODE, 0x89 PACKET_MOUSE, etc.) to prevent packet payloads from
+     being misinterpreted as ASCII keystrokes (e.g. 0x50 'P').
+   - Handles 0x81 PACKET_KEYCODE, passing valid pressed ASCII characters
+     through to @KEYIN while discarding releases and non-ASCII modifiers.
+   - Adds one-time startup FIFO drain on first CKINP call to discard stale
+     packets queued by Quark MOS, loadfont, and OSboot.
+   - Changes CTLUART0 relative jumps to absolute jumps to avoid branch range errors.
+
+2. ipl-strings.s & memory_video.s:
+   - Replaces VT100 ANSI escape codes (ESC [ J, ESC [ f, ESC [ ? 25 l) with
+     native Agon BBC VDU control codes (VDU 12 for CLS, VDU 30 for Home Cursor).
+   - Preserves exact 4-byte and 9-byte structure sizes.
+
+3. ipl_sessions.s & ipl-trsdos.s:
+   - Ensures realtim session initializes session_cmd$ with spaces instead of
+     "cls", allowing clean IPL exit via SYS_EXIT 0 to the command prompt.
+   - Sets initial cursor location to row 0, col 0.
+
+4. interrupt_handler.s:
+   - Fixes video buffer pump length from CRTSIZE+2 to CRTSIZE+9 so all 1920
+     video RAM bytes are refreshed across UART0 without truncation.
+
+--- a/TRSDOS_7/SYSRES/drivers/driver-uart0.s
++++ b/TRSDOS_7/SYSRES/drivers/driver-uart0.s
+@@ -41,9 +41,9 @@
+ 
+ CTLUART0	LD	A,C			; Get @CTL byte
+ 		OR	A			; @CTL 00?
+-		JR	Z,CANISND		; Go if so
++		JP	Z,CANISND		; Go if so
+ 		DEC	A
+-		JR	Z,CTL1			; Go if CTL 01
++		JP	Z,CTL1			; Go if CTL 01
+ 		DEC	A
+ 		JR	Z,CTL2			; CTL 02 "init uart"
+ 		CP	4-2			; Wakeup feature?
+@@ -186,7 +186,13 @@
+ 		ld	a,0			; A=0 No error.
+ 		ret
+ 
+-CKINP		IN0     A,(UART0_LSR)		; Get status of data waiting?	IN A,(UARTST)	; Check if actually RX.
++CKINP		LD	A,(u0_flushed_flg)
++		OR	A
++		JR	NZ,u0_is_clean
++		INC	A
++		LD	(u0_flushed_flg),A
++		CALL	flush_u0_fifo
++u0_is_clean	IN0     A,(UART0_LSR)		; Get status of data waiting?	IN A,(UARTST)	; Check if actually RX.
+ 		AND     UART_DR     		; Char waiting?
+ 		JR      Z,nochar		; Make NZ, NO char waiting.
+ 			
+@@ -201,9 +207,11 @@
+ 		;ld	b,00000000b		; Set TRS-80 modem status register to char waiting.
+ 
+ 		IN0    	A,(UART0_RBR)		; Get byte from UART0.
++		BIT	7,A			; Agon: test for VDP packet (>=0x80)
++		JR	NZ,vdp_pkt
+ 		LD	C,A			; Save it in C.
+ 			
+-		cp	ESC.asc			; User hit escape? If so inc count by 1.
++norm_char	cp	ESC.asc			; User hit escape? If so inc count by 1.
+ 		ld	a,(esccount)
+ 		jr	nz,resetesc
+ 		dec	a
+@@ -247,6 +255,65 @@
+ 		cp	A			; Set Z flag.
+ 		ret
+ 
++; VDP Packet Handler for Agon Light / Fab Agon Emulator
++; VDP packets: [0x80+code] [len] [payload...]
++; Packet 0x81 (PACKET_KEYCODE): len=4, payload=[ascii, modifiers, vk_code, is_down]
++; All other packets (e.g. 0x86 PACKET_MODE, 0x89 PACKET_MOUSE) are discarded.
++
++vdp_pkt		PUSH	DE
++		LD	D,A			; D = packet code
++		CALL	u0_gb			; Read length byte
++		LD	E,A			; E = payload length
++		LD	A,D
++		CP	81h			; Is it PACKET_KEYCODE?
++		JR	NZ,vdp_discard
++
++		CALL	u0_gb			; Byte 1: ascii
++		LD	D,A			; Save ascii in D
++		CALL	u0_gb			; Byte 2: modifiers
++		CALL	u0_gb			; Byte 3: vk_code
++		CALL	u0_gb			; Byte 4: is_down
++		OR	A			; Key pressed? (1=press, 0=release)
++		JR	Z,vdp_next		; Ignore key release
++		LD	A,D			; A = ascii
++		OR	A			; Valid character?
++		JR	Z,vdp_next		; Ignore non-ascii modifier
++		POP	DE
++		LD	C,A			; Character in C
++		JP	norm_char
++
++vdp_discard	LD	A,E
++		OR	A
++		JR	Z,vdp_next
++		CALL	u0_gb
++		DEC	E
++		JR	vdp_discard
++
++vdp_next	POP	DE
++		JP	CKINP
++
++u0_gb		IN0	A,(UART0_LSR)
++		AND	UART_DR
++		JR	Z,u0_gb
++		IN0	A,(UART0_RBR)
++		RET
++
++u0_flushed_flg	db	0			; 0=not flushed yet, 1=flushed
++; Flush UART0 FIFO on initialization
++flush_u0_fifo	PUSH	BC
++fu0_loop	LD	BC,2000h
++fu0_wait	IN0	A,(UART0_LSR)
++		AND	UART_DR
++		JR	NZ,fu0_read
++		DEC	BC
++		LD	A,B
++		OR	C
++		JR	NZ,fu0_wait
++		POP	BC
++		RET
++fu0_read	IN0	A,(UART0_RBR)
++		JR	fu0_loop
++
+ ; Character PUT request. Transmit byte in register C.
+ 
+ TXUART0:	call	CANISND
+--- a/TRSDOS_7/SYS0_IPL/ipl-strings.s
++++ b/TRSDOS_7/SYS0_IPL/ipl-strings.s
+@@ -42,8 +42,8 @@
+ initialflg	db	0
+ score		db	0
+ safeipl$	db	"n",CR.asc
+-vt100_clear$	db	ESC.asc,"[J",ETX.asc			; Clear video screen.
+-vt100_home$	DB	ESC.asc,"[f",ETX.asc			; Cursor to home position.
++vt100_clear$	db	12,0,0,ETX.asc			; Agon VDP: 12=CLS
++vt100_home$	DB	30,0,0,ETX.asc			; Agon VDP: 30=Home Cursor
+ 
+ quiet_default	dw	0					; Default value for IPL in quiet mode.
+ 
+--- a/TRSDOS_7/SYS0_IPL/ipl_sessions.s
++++ b/TRSDOS_7/SYS0_IPL/ipl_sessions.s
+@@ -55,7 +55,7 @@
+ 		ret
+ realtim		ld	a,4
+ 		ld	(quiet_default_flg),a
+-		MVC	realtim$,session_cmd$,15
++		MVC	defltterm$,session_cmd$,15
+ 		xor	a				; A=0 or NOP.
+ 		ld	(pump_switch_value),a		; Enable pump switch, this updates display in real time.
+ 		ret
+--- a/TRSDOS_7/SYS0_IPL/ipl-trsdos.s
++++ b/TRSDOS_7/SYS0_IPL/ipl-trsdos.s
+@@ -43,7 +43,7 @@
+ no_auto		PUMP	DEVICE.console,vt100_home$		; Cursor upper left corner.
+ 		PUMP	DEVICE.console,vt100_clear$		; Clear video screen on terminal...make nice clean.
+ 		
+-		locate.CURSOR 22,0
++		locate.CURSOR 0,0
+ 
+ 		ld	a,(session_cmd$)			; Get 1st char.
+ 		cp	' '					; No command?
+--- a/TRSDOS_7/SYSRES/memory/memory_video.s
++++ b/TRSDOS_7/SYSRES/memory/memory_video.s
+@@ -1,7 +1,7 @@
+ 
+ 			org	zspace.VIDEO$-9				; Video control codes resides here.
+-			db	ESC.asc,"[f"				; Cursor to home position.
+-			db	ESC.asc,"[?25l" 
++			db	30,0,0					; Agon VDP: 30=Home Cursor
++			db	0,0,0,0,0,0
+ 
+ 			org	zspace.VIDEO$				; Video RAM resides here.
+ 			db	"Copyright 2024 Daniel Paul Martin, All rights reserved."
+--- a/TRSDOS_7/SYSRES/interrupts/interrupt_handler.s
++++ b/TRSDOS_7/SYSRES/interrupts/interrupt_handler.s
+@@ -62,7 +62,7 @@
+ 			ld	(pumpcnt),a		; Reset counter to countdown value.
+ 
+ 			ld	hl,zspace.VIDEO$-9	; Point to video RAM.
+-			ld	de,CRTSIZE+2		; Size of video screen in dec (1920).
++			ld	de,CRTSIZE+9		; Size of video screen + 9 prefix bytes.
+ 
+ canisend1		IN0	a,(UART0_MSR)		; Get CTS status & test if CTS is ready..
+ 			BIT	4,A			; If other end sets CTS true, they are ready to receive.I just
