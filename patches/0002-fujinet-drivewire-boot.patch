@@ -1,0 +1,780 @@
+Subject: [PATCH] Phase 1: Pure Network Boot of Drive :0 over DriveWire 3/4 (OP_READEX 0xD2)
+
+Phase 1 Deliverables:
+- Eliminate embedded 425 KB RAM disk, yielding lean 66,048-byte TRSDOS.bin
+- Implement DriveWire OP_READEX (0xD2) sector read with 16-bit big-endian checksum in driver-FDCDVR.S
+- Implement dw_offset table supporting DiskDISK (+1 sector offset) and JV1 (+0 offset) images
+- Enforce Stage 1 read-only write protection (R_PROTECTED / Error 15) in DOWRIT
+- Replace in-memory slice scanning in ipl-BIOS.s with direct DriveWire network boot of Drive :0
+
+--- a/TRSDOS_GLOBAL/equates/equates-global-lowcore.s
++++ b/TRSDOS_GLOBAL/equates/equates-global-lowcore.s
+@@ -216,6 +216,12 @@
+ 	XDEF		ramdrv$
+ 	XDEF		reboot
+ 	XDEF		bin2bcd
++	XDEF		dw_offset
++	XDEF		dw_hdr
++	XDEF		dw_chk
++	XDEF		dw_status
++	XDEF		dw_slot
++	XDEF		calc_dw_checksum
+ 
+ ; eZ80 associated xdef's.
+ 
+--- a/TRSDOS_7/SYSRES/drivers/driver-FDCDVR.S
++++ b/TRSDOS_7/SYSRES/drivers/driver-FDCDVR.S
+@@ -31,12 +31,18 @@
+ rd_retries	db	0
+ wr_retries	db	0
+ 
++dw_slot		db	0
++dw_offset	db	1,0,0,0,0,0,0,0			; Per-drive offset (1 for DiskDISK, 0 for JV1)
++dw_hdr		db	0D2h,0,0,0,0			; 5-byte OP_READEX request header
++dw_chk		db	0,0				; 2-byte big-endian checksum
++dw_status	db	0				; 1-byte status return
+ 
++
+ ;       Disk Driver Entry Point
+ ; ____________________________________
+ 
+ FDCBGN		di
+-		ld	(IY+5),d			; Update current track.
++	;	ld	(IY+5),d			; Update current track.
+ 
+ 		ld	a,c				; Get drive requested code.
+ 		ld	(LDRV$),a			; Store in current logical drive.
+@@ -116,7 +122,7 @@
+ 		ei
+ 		RET					; We are solid state drive, were always ready.	
+ 
+-SEEKTRK		LD	(IY+5),D			; Update current cylinder
++SEEKTRK	;	LD	(IY+5),D			; Update current cylinder
+ 		JR	TSTBSY
+ 
+ STPIN		DEC	(iy+5)				; FUNCTION 5 STEP-IN.
+@@ -143,60 +149,64 @@
+ 
+ 		call	calcsec				; Calculate address of sector to read.
+ 
+-		ld	a,(LDRV$)			; Is this i/o request a network drive?
+-		ld	b,a
+-		cp	6				; Drive 6 is reserved for network.
+-		IF_NE_GOTO not_net_rd 			; This is not network drive, bypass net_read.
++; Phase 1 DriveWire read: route drives to DriveWire OP_READEX (0xD2)
++rd_drivewire	ld	a,(LDRV$)			; Get requested logical drive
++		ld	(dw_slot),a			; Direct 1:1 slot mapping
+ 
+-		ld	a,(net_volume)			; Which volume if any is network?
+-		cp	a,b				; Which volume if any is network?
+-		IF_NE_GOTO not_net_rd 			; This is not network drive, bypass net read.
++		; Add container offset (0 for raw JV1, 1 for DiskDISK header)
++		ld	e,a
++		ld	d,0
++		ld	hl,dw_offset
++		add	hl,de
++		ld	e,(hl)				; E = offset (0 or 1)
++		ld	hl,(fdc_no_sum)			; HL = calculated LSN
++		add	hl,de				; HL = wire LSN on server
+ 
+-; Read sector from network connection.
+-; READ > NETWORK SECTOR HERE <
+-
++		; Prepare 5-byte OP_READEX request header
++		ld	a,0D2h				; OP_READEX opcode
++		ld	(dw_hdr+0),a
++		ld	a,(dw_slot)			; Virtual device slot
++		ld	(dw_hdr+1),a
+ 		xor	a
+-		ld	(rd_retries),a			; Start retry counter off at 0.
++		ld	(dw_hdr+2),a			; LSN [23..16] = 0
++		ld	a,h
++		ld	(dw_hdr+3),a			; LSN [15..8]
++		ld	a,l
++		ld	(dw_hdr+4),a			; LSN [7..0]
+ 
+-		LD	a,'<'				; Symbol used for READ command.
+-read_retry	ld	(net_cmd),a			; Stuff direction in command buffer.
+-
+-		HEXDEC	(fdc_no_sum),net_cmd+1		; Convert 16 bit address to ascii in network command.
+-		ZEROS_RPL_SPACE	net_cmd+1		; Convert leading spaces in buffer to 0's.
+-
+-		ld	a,07h				; Flush UART1 RX/TX FIFOs before request (Olimex MOD-WIFI-ESP8266 stream)
++		; Flush UART1 RX/TX FIFOs before request
++		ld	a,07h
+ 		out0	(UART1_FCTL),a
+ 
+-		PUMP	DEVICE.serialnet,net_cmd 	; Send <XXXXX LF.asc packet.
++		; Transmit 5-byte request header over UART1
++		UART1.put.bytes 5,dw_hdr,fdc_rd_timeout
+ 
+-		pop	hl				; Recover destination buffer address.
+-		push	hl				; Save again for checksum routine.
++		; Receive 256-byte sector data directly into target buffer
++		pop	hl				; Recover user destination buffer pointer
++		push	hl				; Save for checksum
++		UART1.get.bytes 0,hl,fdc_rd_timeout	; Length 0 = 256 bytes
+ 
+-		UART1.get.bytes	0,hl,fdc_rd_timeout 	; Get from server 256 byte sector requested.
+-		UART1.get.bytes	4,chk_sum,fdc_rd_timeout ; Get from server 4 byte checksum.
++		; Calculate 16-bit big-endian unsigned checksum
++		pop	hl				; Recover buffer pointer
++		push	hl				; Keep on stack for rd_finish
++		call	calc_dw_checksum		; Computes sum: D=MSB, E=LSB
++		ld	a,d
++		ld	(dw_chk+0),a
++		ld	a,e
++		ld	(dw_chk+1),a
+ 
+-		pop	hl				; Get pointer to buffer.
+-		push	hl				; Keep buffer address on stack for potential retry.
+-		GOSUB	calc_cksum
+-		ld	b,a
+-		ld	a,(chk_sum+3)
+-		cp	b
+-		IF_NE_GOTO rd_retry_cksum		; Checksum mismatch -> retry
+-		pop	hl				; Discard buffer address
+-		GOTO	rd_finish			; Checksum valid -> finish
++		; Transmit 2-byte checksum to server
++		UART1.put.bytes 2,dw_chk,fdc_rd_timeout
+ 
+-; Here we have a error on read.
+-; Bump retry counter.
+-; Set server command to retry.
+-; If retries does not roll over to 0 go around again.
++		; Receive 1-byte status from server (0x00 = success)
++		UART1.get.bytes 1,dw_status,fdc_rd_timeout
++		ld	a,(dw_status)
++		or	a
++		jr	nz,fdc_rd_err
+ 
+-rd_retry_cksum	ld	hl,rd_retries
+-		inc	(hl)				; Bump counter by 1.
+-		IF_EQ_GOTO	fdc_rd_err		; If counter rolls over to 0 we have 256 retries, abort i/o.
+-		ld	a,'\'				; Retry signal to server.
+-		GOTO	read_retry
++		pop	hl				; Clean up buffer pointer from stack
++		jp	rd_finish			; Clean exit via authentic LS-DOS handler
+ 
+-
+ rd_finish	POP	de				; Restore DE to track/sector.
+ 		ld	a,d				; Get track we just read.
+ 		cp	(IY+9)				; Compare directory track to track we just read.
+@@ -208,106 +218,15 @@
+ 		ei
+ 		RETURN					; Return with NZ flag set indicating error.
+ 
+-; Read sector from RAM drive.
+-; > READ MEMDISK SECTOR HERE <.
+ 
+-not_net_rd
+-		LD.L	hl,(PADDRESS)			; HL now contains 24b address pointing to sector in RAM drive.
+-		xor	a
+-		LD	(PADDRESS+2),a			; A contains 0 to zero out upper 8 bits of 24b address.
+-		POP	de				; Point DE to destination buffer.
+-		LD	(PADDRESS),de			; A-=0 from above code.
+-		LD.L	DE,(PADDRESS)			; DE now contains 24b destination pointer.
+-		LD.L	bc,100h				; Move one SECtor or 256B.		
+-		LDIR.L					; Move sector from RAM DRIVE to BUFFER.
+-		GOTO	rd_finish			; Received sector, continue to finish.
+-
+-DOWRIT	; I/O request handler WRITE routine, write sector to RAM DRIVE.
+-
+-		bit	7,(iy+3)			; Test WP flag in DCT.
+-		JR	Z,wp_ok				; If disk WP on then we skip following code.		
++DOWRIT	; Stage 1 write protection: reject writes with R_PROTECTED (Error 15)
+ 		pop	bc				; Recovered from save on entry to driver.
+ 		POP	HL				; Per Soltoff we restore on exit any registers we used.
+-		LD	A,15				; Error disk WP. Return with NZ & error code 15.
+-		ret					; Return with NZ & disk WP error in A.
+-
+-wp_ok		push	de				; D - contains track. E contains sector.						
+-		PUSH	HL				; Save 16b pointer to buffer.
+-			
+-		call	calcsec				; Calculate address of sector to write.
++		LD	A,15				; Error 15 = R_PROTECTED (Write Protected)
++		or	a				; Set NZ for error
++		ei
++		RET
+ 
+-		ld	a,(LDRV$)			; Is this i/o request a network drive?
+-		ld	b,a
+-		cp	6				; Drive 6 is reserved for network.
+-		IF_NE_GOTO fdc_not_net_wr 		; This is not network drive, bypass net_read.
+-
+-		ld	a,(net_volume)			; Which volume if any is network?
+-		cp	a,b				; Which volume if any is network?
+-		IF_NE_GOTO fdc_not_net_wr 		; This is not network drive, bypass net read.
+-
+-; > WRITE sector to NETWORK CONNECTION HERE <
+-
+-		HEXDEC	(fdc_no_sum),net_cmd+1		; Convert 16 bit address to ascii in network command.
+-
+-		ZEROS_RPL_SPACE	net_cmd+1		; Convert leading spaces in buffer to 0's.
+-
+-		xor	a
+-		ld	(wr_retries),a			; Start retry counter off at 0.
+-
+-		LD	a,'>'
+-wr_retry	ld	(net_cmd),a			; Stuff direction in command buffer.
+-
+-		ld	a,07h				; Flush UART1 RX/TX FIFOs before request (Olimex MOD-WIFI-ESP8266 stream)
+-		out0	(UART1_FCTL),a
+-
+-		PUMP	DEVICE.serialnet,net_cmd 	; Send @<XXXXX LF.asc packet.
+-
+-		pop	hl				; Recover buffer address for read.
+-		push	hl				; Leaving one copy on stack.
+-
+-		UART1.put.bytes	0,hl,fdc_wr_timeout 	; Write to server 256 byte sector.
+-		
+-		pop	hl				; Get buffer address.
+-		push	hl				; Leaving one copy on stack.
+-		GOSUB	calc_cksum			; Calculate checksum for buffer.
+-		ld	(chk_sum+3),a			; Store these 8 bits in little endian of 32 bit python int.
+-		push	af				; Save checksum for now.
+-
+-		UART1.put.bytes	4,chk_sum,fdc_wr_timeout1 ; Send server 4 byte int containing checksum.
+-
+-		UART1.get.bytes	4,chk_sum,fdc_wr_timeout1 ; Get 4 byte checksum returning from server.
+-
+-		pop	bc				; Recover original checksum, B will have old A.
+-		ld	a,(chk_sum+3)			; Compare round trip checksum in buffer to original.
+-		cp	b
+-		IF_EQ_GOTO	net_wr_done		; Another job well done!
+-
+-		ld	hl,wr_retries
+-		inc	(hl)				; Ooops bump counter +1.
+-		IF_EQ_GOTO	fdc_wr_err		; If rolling over to 0 it means 256 retries, abort this write.
+-		ld	a,'/'				; Signal server this is a write retry using retry char.
+-		GOTO	wr_retry
+-	
+-net_wr_done	pop	hl				; Discard buffer address.
+-		POP	de				; Restore DE to track/sector.
+-		jp	TSTBSY
+-
+-fdc_not_net_wr	; > WRITE sector to MEMDISK HERE <
+-
+-		LD.L	de,(PADDRESS)			; de now contains 24b address pointing to sector in RAM drive.
+-
+-		POP	hl				; Recover pointer to source.
+-		LD	(PADDRESS),hl			; Place 16 bit destination address in buffer.
+-		xor	a
+-		LD	(PADDRESS+2),a			; A-=0 from above code. Zero out upper 8 bits of 24b address.
+-
+-		LD.L	hl,(PADDRESS)			; HL now contains 24b source pointer.
+-		LD.Lil	BC,100h				; Move one SECtor or 256B.
+-		LDIR.L					; Move sector from BUFFER to RAM DRIVE.
+-
+-		POP	de				; Restore DE to track/sector.
+-		jp	TSTBSY
+-
+ ; IY points do DCTx$
+ ; D - contains track.
+ ; E - contains sector.
+@@ -330,7 +249,7 @@
+ ; 2nd calculate sectors per cylinder.
+ ; D-contains track, E contains sector.
+ 
+-FRCSID0		LD	hl,DE				; sector in lower 8 bits of HL.
++FRCSID0		LD	l,E				; sector in lower 8 bits of HL.
+ 		ld	h,0				; Zero upper 8 bits. HL now contains sector.
+ 		LD	A,(IY+7)			; P/U sectors per track.
+ 		AND	1Fh				; Mask out all but # SEC per TRK.
+@@ -344,10 +263,29 @@
+ 
+ stp23		LD	E,A				; Move # of SEC per CYL to E.
+ 		MLT	DE				; we then multiply (# CYL * SEC per CYL) 16b result in DE.
+-		add	hl,de				; Add in sector number we saved before.
+ 
+-		ld	(fdc_no_sum),hl	; Save sum w/o offset for net driver.
++		bit	3,(iy+3)			; Is this a HD?
++		jr	z,not_hd			; If no, not a HD.
+ 
++		bit	5,(iy+4)			; If HD is yes is DBLBIT set?
++		jr	z,not_hd			; Nah...skip doubling.
++
++		ld	a,(iy+7)
++		and	11100000b			; Strip out # of heads.
++		sra	a
++		sra	a
++		sra	a
++		sra	a
++		sra	a				; Shift all bits # heads right, 4 heads = 3 or 011.
++
++keep_mpy	sla	e				; If yes double product.
++		rl	d				; Shift overflow if any into d, thus DE=DE*2.
++		sra	a
++		jr	nz,keep_mpy			; Repeat until we multiply by 2 as many heads exist this partition.
++
++not_hd		add	hl,de				; Add in sector number we saved before.
++		ld	(fdc_no_sum),hl			; Save sum w/o offset for net driver.
++
+ ; 4th, using upper 16 bits of RAM drive base address, add in offset using results of above calculation.
+ ; Leave results in HL.
+ ; RAMDRV$ below was populated at entry to driver by looking up using drive #.
+@@ -394,4 +332,16 @@
+ 		LOOP	calc_cksum+3
+ 		RETURN
+ 
++calc_dw_checksum:
++		ld	de,0				; DE = 16-bit big-endian sum
++		ld	b,0				; 256 iterations
++dw_chk_loop:	ld	a,(hl)
++		inc	hl
++		add	a,e
++		ld	e,a
++		jr	nc,dw_chk_nocarry
++		inc	d
++dw_chk_nocarry:	djnz	dw_chk_loop
++		ret
++
+ FDCEND:		EQU	$-1
+\ No newline at end of file
+--- a/TRSDOS_7/SYS0_IPL/ipl-BIOS.s
++++ b/TRSDOS_7/SYS0_IPL/ipl-BIOS.s
+@@ -41,101 +41,68 @@
+ 
+ pastshawn	PUMP	DEVICE.console,splashiplmode	; Report CPU registers initialized.
+ 				
+-; Get SLICE 0 @ 010000h. Slice 0 points to slices 1-9. Move slicetable in RAM for 9 slices (1-9).
++; Read FujiNet Slot 0 LSN 0 (raw sector 0 / container header) over UART1
++		ld	a,07h				; Flush UART1 FIFOs
++		out0	(UART1_FCTL),a
+ 
+-		LD.Lil	HL,010000h			; HL now contains 24b address pointing to file info of RAM drive.
+-		LD.L	DE,slicebuf 			; Convert 16 bit destination address to 24 bit.
+-		LD.L	BC,256				; Copy 256 bytes, HL contains 24b source & DE destination.
+-		LDIR.L					; Copy now.
+-		MVC slicebuf,slicetable,27		; Move slice table to table in memory.
+-
+-; Get SLICE 1 pointed to by SLICE 0.
+-
+-		ld.l	hl,(slicetable)			; HL now contains 24b address pointing to file info of RAM drive.
+-		LD.lil	de,slicebuf			; Convert 16 bit destination address to 24 bit.
+-		LD.L	BC,256				; Copy 256 Bytes, HL contains 24b source.
+-		LDIR.L					; Copy now.
+-			
+-; Slicebuf now contains SLICE 1.
+-; SLICE 1 first 3 bytes, is an offset to boot volume, VOLUME 0.
+-
+-; Now we get volume 0 HEADER in volbuf.
+-; Using SLICE 1 offset to calculate physical address to VOLUME 0 (boot volume).
+-
+-		ld	hl,(slicebuf+1)			; Get offset to VOLUME 1.
+-		ld	de,(slicetable+1)		; Get upper 16 bits of pointer to slice 1.
+-		add	hl,de				; offset = offset + base pointer of slice 1.
+-			
+-; Using pointer to RAMDRIVE, copy first sector to volbuf.
+-; HL now points to slice 1.
+-
+-		xor	A				; A = 0 for below code.
+-		LD	(XXX),a
+-		ld	(XXX+1),hl			; Store base of slice 1 + offset to volume 0.
+-			
+-; But first store this pointer in driver for RAM drive.
+-
++		ld	hl,dw_hdr
++		ld	(hl),0D2h			; OP_READEX
+ 		inc	hl
+-		ld	(ramdrv$),hl			; Store in 0 slot of RAM driver table of addresses.
++		ld	(hl),0				; Slot 0
++		inc	hl
++		ld	(hl),0				; LSN [23..16]
++		inc	hl
++		ld	(hl),0				; LSN [15..8]
++		inc	hl
++		ld	(hl),0				; LSN [7..0]
+ 
+-; Load volume 0  header/sector 0 into volbuf.
++		UART1.put.bytes 5,dw_hdr,mounterr0
++		UART1.get.bytes 0,volbuf,mounterr0
+ 
+-		LD.L	HL,(XXX)			; Load HL with 24b address of RAM drive.
+-		xor	a
+-		LD	(XXX+2),a			; Zero out upper 8 bits of 24b address.
+-		LD	de,volbuf			; Convert 16 bit destination address to 24 bit.
+-		LD	(XXX),de			; Store 16 bit address of volbuf destination.
+-		LD.L	DE,(XXX)			; DE contains 24b destination.
+-		LD.L	BC,256				; Copy 256 bytes, one sector, HL contains 24b source.
+-		LDIR.L					; HL contains pointer to RAM drive. Copy now.
++		ld	hl,volbuf
++		call	calc_dw_checksum
++		ld	a,d
++		ld	(dw_chk+0),a
++		ld	a,e
++		ld	(dw_chk+1),a
++		UART1.put.bytes 2,dw_chk,mounterr0
++		UART1.get.bytes 1,dw_status,mounterr0
++		ld	a,(dw_status)
++		or	a
++		jp	nz,mounterr0
+ 
+-; Now test if first 8 bytes of buffer contain ASCII string 'DiskDISK'. 
+-; If yes, this volume is in Misosys DiskDISK format.
+-; Else assume TRS-80 floppy disk format.
++; Test if first 8 bytes match 'DiskDISK'
++		ld	bc,8
++		ld	hl,string1$			; 'DiskDISK'
++		ld	de,volbuf
++tstmore0	ld	a,(de)
++		inc	de
++		cpi
++		jp	nz,not_diskdisk0
++		jp	v,tstmore0
+ 
+-		ld	bc,8				; Test a string length of 8 characters.
+-		ld	hl,string1$			; Get pointer to string containing 'DiskDISK'
+-		ld	de,volbuf			; Address of buffer to test.
+-tstmore0	ld	a,(de)				; Get char pointed to by DE.
+-		inc	de				; Bump to next char.
+-		cpi					; Test and increment HL & DE while decrementing BC (char count).
+-		jp	nz,mounterr0			; If they dont match we can stop now.
+-		jp	v,tstmore0			; If BC <> 0 after CPI then continue looping until it does.
++; Image is DiskDISK format (has 1-sector header)
++		ld	a,1
++		ld	(dw_offset),a
++		mov.BYT volbuf,boottyp$,8		; Move 'DiskDISK' to menu
++setup_dct0	MVC	volbuf+11,DCT0$+3,7		; Move DiskDISK DCT to drive 0 DCT
++		ld	iy,DCT0$
++		set	7,(iy+3)			; Stage 1 Read-Only write protection
++		set	0,(iy+4)			; Drive 0
++		set	4,(iy+4)			; Alien controller
++		jr	past_jv1_0
+ 
+-		mov.BYT volbuf,boottyp$,8		; Move boot volume name (DiskDisk) to menu.
+-setup_dct0	MVC	volbuf+11,DCT0$+3,7		; Move DiskDisk DCT to drive 0 DCT.
+-		ld	iy,DCT0$			; dct1.
+-		set	0,(iy+4)			; Tell world this is drive 0.
+-		ld	d,(iy+6)			; Get max cylinders.
+-		inc	d				; Adjust +1.
+-		ld	a,(iy+7)			; Get config, lower nibble contains sec per trk.
+-		and	3Fh				; Get lower nibble containing sectors per trk.
+-		inc	a
+-		bit	5,(IY+4)			; Sides = 2?
+-		jr	z,pastdbl			; If so then we double sectors per track.
+-		sla	a				; Sectors per track = sectors per track * 2.
+-pastdbl		ld	e,a				; Setup to multiply track * sectors per track.
+-		MLT	DE				; we then multiply (# CYL * SEC per CYL) 16b result in DE.
+-		push	de				; Save a copy of MLT results.
+-		inc	de				; Bump one sector higher to adjust for diskdisk header.
+-		ld	BC,bootsiz$			; Address to store ASCII result in string.
++not_diskdisk0	xor	a
++		ld	(dw_offset),a
++		MVC	jv1$,boottyp$,8			; Move JV1 to boot menu
++		ld	a,(volbuf+2)			; Directory cylinder index
++		ld	(DCT0$+9),a
++		ld	iy,DCT0$
++		set	7,(iy+3)			; Stage 1 Read-Only write protection
++		set	0,(iy+4)
++		set	4,(iy+4)
+ 
+-; Convert DE to 24 bit by  H=D, L=E, E=0    24 BIT--> E:HL.
+-; Store ASCII representation of 24 bit value in main memu.
+-; Convert to packed BCD.
+-; Convert packed BCD to unpacked.
+-; Convert unpacked to ASCII.
+-; Trim leading 0's away.
+-; Stuff all these results in main menu.
+-
+-		call		cvt_24_ascii
+-
+-		pop		de			; Recover original MLT results.
+-		ld		hl,2			; offset to VOLUME 1. VOl 0 length+diskdisk hdr sector VOLUME 0).
+-		add		hl,de			; Add size of VOLUME 0 and this will be where VOL 1 starts.
+-		ld.lil		(010104h),hl		; Offset to volume 1 image.
+-		ld		(slicebuf+4),hl		; Update table bc it has already been built.
+-
++past_jv1_0
+ ; Update current cylinder to 0.
+ 
+ 		xor		a			; Its way it is on real model 4.
+@@ -224,285 +191,17 @@
+ 
+ nosysgenmsg	CKDRIVE		0,mounterr0		; See if TRSDOS finds formatted media it can read. If not, stop IPL.
+ 
+-; slicebuf now contains SLICE 1. Bytes 3,4,5 is an offset to data VOLUME 1 (TRS-80 drive 1).
+-; Get sector 0 of volume 1 in volbuf.
+-
+-; Using SLICE 1 offset to VOLUME 1, calculate physical address to ram drive.
+-
+-		ld		de,(slicetable+1)	; Get upper 16 bits of pointer to slice 1.
+-		ld		hl,(slicebuf+4)		; Get offset to VOLUME 1.
+-		add		hl,de			; offset = offset + base pointer of slice 1.
+-		
+-; Using pointer to RAMDRIVE, copy first sector to volbuf.
+-
+-		xor		A			; A = 0 for below code.
+-		LD		(XXX),a			; Zero lower 8 bits.
+-		ld		(XXX+1),hl		; Store upper 16 bit pointer to VOL1.
+-			
+-; But first store this pointer in driver for RAM drive.
+-
+-		inc		hl			; Advance pointer one page to actual RAMDRIVE contents.
+-		ld		(ramdrv$+2),hl		; Store in slot 1 of RAM driver table of addresses.
+-
+-; Now copy sector 0 of a drive image or diskdisk header to volbuf (either way, first record of volume).
+-
+-		LD.l		HL,(XXX)		; Load HL with 24b address of RAM drive.
+-		LD		de,volbuf		; Convert 16 bit destination address to 24 bit.
+-		LD		(XXX+2),a		; Zero out upper 8 bits of 24b address.
+-		LD		(XXX),de		; Store address lower 16bits.
+-		LD.L		DE,(XXX)		; DE=24b destination address.
+-		LD.L		BC,256			; Copy 256 Bytes, HL contains 24b source.
+-		LDIR.L					; Copy now.
+-
+-		ld		iy,DCT1$
+-		set		1,(iy+4)		; Set 2nd physical drive (drive 1).
+-
+-; We test string1$ which contains DiskDISK string against volbuff contents.
+-
+-		ld		bc,8			; Test a string length of 8 characters.
+-		ld		hl,string1$		; Get pointer to string containing 'DiskDISK'
+-		ld		de,volbuf		; Address of buffer to test.
+-tstmore1	ld		a,(de)			; Get char pointed to by DE.
+-		inc		de			; Bump to next char.
+-		cpi					; Test and increment HL & DE while decrementing BC (char count).
+-		jr		nz,notdskdsk		; If they dont match we can stop now.
+-		jp		v,tstmore1		; If BC <> 0 after CPI then continue looping until it does.
+-		jr		dskdsk			; Finished testing, all match. Pass control to match code.
+-
+-; Arriving here we are not mounting a DiskDisk volume.
+-; Change datatyp$ to JV1
+-; Recover pointer to RAM drive image and change from DD to JV1 by changing pointer to beginning. Begin=begin-1 sector.
+-; JV1 image starts at xxxxxxh DiskDisk actual drive image starts at xxxxxxh+0100h.
+-
+-; Adjust pointer for RAMDRIVE since this is not DiskDISK in Volume 1.
+-
+-notdskdsk	MVC		jv1$,datatyp$,8		; Change data type to JV1.
+-
+-		LD		A,0			; Get Z80 NOP opcode.
+-		ld		(not_DD),a		; Change inc de to nop.
+-
+-		ld		hl,(ramdrv$+2)		; Slot for this Volume of RAM driver table of addresses.
+-		dec		hl			; Pointer = pointer - one sector.
+-		ld		(ramdrv$+2),hl		; Store adjusted pointer back.
+-
+-		xor		a
+-		ld		(DCT1$+5),a		; Set track position of head.
+-
+-; Now read track=0 sector=0 of drive=1 & recover pointer to directory cylinder.
+-
+-		LD		HL,volbuf		; HL points to buffer of READ.
+-		ld		d,0			; D=> Track 0.
+-		ld		e,0			; E=> Sector 0.
+-		ld		c,1			; C=> C contains drive #1.
+-		ld		b,9			; B=> Function in register B.
+-		call		FDCDVR			; Call driver.
+-
+-		ld		a,(volbuf+2)		; Sector 0 of a drive image is on volbuf.
+-		ld		(DCT1$+9),a		; Point DCT to true directory cylinder.
+-
+-		set		1,(iy+4)		; Tell world this is drive 1.
+-		set		4,(iy+4)		; Tell world this is an alien controller.
+-
+-; Set density for single and make first attempt @finding directory.
+-
+-		ld		bc,2409h		; Setup for single density.
+-		ld		(iy+7),c
+-		ld		(iy+8),b		; Tell OS this volume is formatted in single density. 
+-
+-		jr		get1dir
+-
+-; Arriving here it verified we are mounting a DiskDISK for volume 1.
+-; Move DCT from DD header to drive 1 DCT.
+-; Move file type from volbuf to datatyp$ in menu.
+-
+-; Pointers built in storage driver already point to correct place for diskdisk.
+-; DiskDISK header still resides in volbuf.
+-
+-; Mounted drive has been determined to be DISKDisk.
+-; Sector 0 of DISKDisk file is still in volbuf. 
+-; Recover DCT for this drive and copy to system DCT1$.
+-; Also set main menu to show DISKDisk type for this volume.
+-
+-dskdsk		MVC	volbuf,datatyp$,8		; Copy name of DiskDISK volume to menu.
+-		MVC	volbuf+11,DCT1$+3,7		; Recover DCT settings for this DiskDISK volume to DCT 1.
+-	
+-		ld	a,(DCT1$+4)			; Drive 1.
+-		and	0F0h				; Strip out drive select bits.
+-		set	0,a				; Make this drive #1.
+-		set	4,a				; Tell world this is an alien controller.
+-		set	6,a				; Capable of double density.
+-		ld	(DCT1$+4),a
+-
+-		xor	a				; Update DCT, its way it is on real model 4.
+-		ld	(DCT1$+5),a			; Cylinder=0.
+-
+-; Now read track=0 sector=0 of drive=1 & recover pointer to directory cylinder.
+-
+-		ld	iy,DCT1$			; dct1.
+-		LD	HL,volbuf			; HL points to buffer of READ.
+-		ld	d,0				; D=> Track 0.
+-		ld	e,0				; E=> Sector 0.
+-		ld	c,1				; C=> C contains drive #1.
+-		ld	b,9				; B=> Function in register B.
+-		call	FDCDVR				; Call driver.
+-
+-; Get pointer to directory and place in DCT1 directory pointer.
+-
+-		ld	a,(volbuf+2)			; Sector 0 of a drive image is on volbuf.
+-		ld	(DCT1$+9),a			; Point DCT to true directory cylinder.
+-
+-; Now read directory as pointed to by recovered directory cylinder pointer.
+-
+-; Now read 1st sector of directory.
+-
+-get1dir		ld	iy,DCT1$			; dct1.
+-		ld	a,(DCT1$+9)
+-		LD	HL,volbuf			; HL points to buffer of READ.
+-		ld	d,a				; D=> Track, A contains directory cylinder.
+-		ld	e,0				; E=> Sector 0.
+-		ld	c,1				; C=> C contains drive #1.
+-		ld	b,9				; B=> Function in register B.
+-		call	FDCDVR				; Call driver.
+-
+-; Make sure driver reported error #6. 
+-; We are reading from directory thus driver should have generated error #6.
+-; Error #6 is normal, no error is abnormal.
+-
+-		jr	z,$				; No error 6 means it was not a system sector.
+-		cp	6				; Error on reading system sector.
+-		call	nz,nodirectort1
+-
+-; volbuf now contains GAT,--- first sector of directory.
+-
+-		ld	a,(volbuf+0d0h)			; Get 1st char of volume name.
+-		or	a				; If filename starts with 00h then its bum steer.
+-		jp	z,switch_den			; Switch density then try getting again..
+-		ld	a,(volbuf+0cbh)			; Get version that formatted this volume.
+-		and	0F0h				; Strip of right hex digit.
+-		cp	060h				; Make sure this volume created by a DOS 6.x version.
+-		jr	z,setup_dct1			; If this volume formatted by DOS 6.x skip to setting up DCT
+-		cp	050h				; If not formatted by LSDOS 6.x was it 5.x?
+-		call	nz,not56fmt			; Report no system directory.
+-		jr	setup_dct1
+-
+-switch_den	ld	bc,4511h			; Values needed to set double density.
+-		ld	(iy+7),c
+-		ld	(iy+8),b			; Tell OS this volume is formatted in double density. 
+-
+-; Try getting first sector of directory again using double density.
+-
+-		ld	iy,DCT1$			; dct1.
+-		ld	a,(DCT1$+9)
+-		LD	HL,volbuf			; HL points to buffer of READ.
+-		ld	d,a				; D=> Track, A contains directory cylinder.
+-		ld	e,0				; E=> Sector 0.
+-		ld	c,1				; C=> C contains drive #1.
+-		ld	b,9				; B=> Function in register B.
+-		call	FDCDVR				; Call driver.
+-
+-; Make sure driver reported error #6. 
+-; We are reading from directory thus driver should have generated error #6.
+-; Error #6 is normal, no error is abnormal.
+-
+-		jr	z,$				; No error 6 means it was not a system sector.
+-		cp	6				; Error on reading system sector.
+-		call	nz,nodirectort1
+-
+-; volbuf now contains GAT,--- first sector of directory using double density settings.
+-; Test and see if we found true directory.
+-
+-		ld	a,(volbuf+0d0h)			; Get 1st char of volume name.
+-		or	a				; If filename starts with 00h then its bum steer.
+-		call	z,nodirectort1			; Switch density then try getting again.
+-
+-		ld	a,(volbuf+0cbh)			; Get version that formatted this volume.
+-		and	0F0h				; Strip of right hex digit.
+-		cp	060h				; Make sure this volume created by a DOS 6.x version.
+-		jr	z,setup_dct1			; This was formatted by LSDOS 6.x
+-		cp	050h				; If not formatted by LSDOS 6.x was it 5.x?
+-		call	nz,not56fmt			; Report if not formatted by DOS 5 or 6.
+-
+-setup_dct1	ld	iy,DCT1$			; dct1.
+-		res	0,(iy+4)			; Not drive 0.
+-		set	1,(iy+4)			; Tell world this is drive 1.
+-		set	4,(iy+4)			; Tell world this is an alien controller.
+-
+-		ld	a,(volbuf+0cch)			; Get logical cylinders in excess of 35.
+-		add	35				; Add 35 to get true cylinder count.
+-		push	af
+-		call	c,mounterr1			; Cannot overflow.
+-		pop	af
+-		dec	a				; max_cyl=max_cyl - 1.
+-		push	af
+-		call	c,mounterr1			; Cannot overflow.
+-		pop	af
+-		ld	(iy+6),a			; Make it highest sector per track.
+-
+-		ld	a,(volbuf+0cdh)			; Get configuration byte.
+-		res	5,(IY+4)			; Set sides to 1.	
+-		bit	5,a				; Test number sides when formatted.
+-		jr	z,v0_mounted			; If <>0 then leave sides = 2.
+-		set	5,(IY+4)			; Make sides = 2.
+-
+-v0_mounted	ld	d,(iy+6)			; Get max cylinders.
+-		inc	d				; Adjust +1.
+-		ld	a,(iy+7)			; Get config, lower nibble contains sec per trk.
+-		and	3Fh				; Get lower nibble containing sectors per trk.
+-		inc	a
+-		bit	5,(IY+4)			; Sides = 2?
+-		jr	z,notdbl			; If so then we double sectors per track.
+-		sla	a				; Sectors per track = sectors per track * 2.
+-notdbl		ld	e,a				; Setup to multiply track * sectors per track.
+-		MLT	DE				; we then multiply (# CYL * SEC per CYL) 16b result in DE.
+-
+-; Following instruction changes to NOP if this is not a diskDISK image.
+-
+-not_DD		inc	de				; Bump one sector higher to adjust for diskdisk header.
+-
+-
+-
+-; Stuff Volume 1 size in main menu.
+-; Convert DE to 24 bit by  H=D, L=E, E=0    24 BIT--> E:HL.
+-; Store ASCII representation of 24 bit value in main memu.
+-; Convert to packed BCD.
+-; Convert packed BCD to unpacked.
+-; Convert unpacked to ASCII.
+-; Trim leading 0's away.
+-; Stuff all these results in main menu.
+-
+-		push	de				; Save a copy of MLT results.
+-		ld	BC,datasiz$			; Address to store ASCII result in string.
+-
+-		call	cvt_24_ascii			; Convert 24 bit value to ASCII & stuff in main menu.
+-
+-; Update slice 1 offset for volume 2.
+-
+-		ld.lil	hl,(010104h)			; Recover offset to vol1.
+-		pop	de				; Recover volume 1 length.
+-		inc	de				; Bump one page forward to account for DiskDISK header.
+-		add	hl,de				; New sum. offset to vol1+vol1 length+256 byte DD header.
+-		ld.lil	(010108h),hl			; Offset to volume 2 image stored in slice table 1.
+-		
+-		MVC	volbuf+0D0h,datavol$,8		; Copy volume name.
+-		MVC	volbuf+0D8h,datavol$+9,8	; Copy volume creation date.
+-
++; Phase 1: Set Drive 1 inactive (stub RET)
++		ld	iy,DCT1$
++		ld	(iy+0),0C9h			; RET opcode -> Drive 1 inactive
+ 		ld	iy,DCT0$
+-;		set	7,(iy+3)		; WP vol 0. Force system/jcl to drive 1.
+-	
+-; Last call for alcohol. Either we have 2 ready volumes or we dont.
+-	
+-		CKDRIVE	0,mounterr0			; Volume 0, u ready Fredie? This party not starting if you not here.....
+-		CKDRIVE 1,mounterr1			; Last test, drive 1 <> avail? Tell operator.....we can have a minimum party :-(
+ 
+-; Continue IPL all drives mounted and accounted for.
+-
+ flushkbd	LD	DE,KIDCB$			;  Flush keyboard, type,init ptrs.
+ 		LD	A,3
+ 		CALL	zCTL
+ 
+ ; Test if server for TRSNET connected.
+ 
+-		GOSUB ping_server+3			; Enter ping routine ahead of scroll off call instruction.
+ 
+ ; Delay a bit and allow copyright splash to be read.
+ 
