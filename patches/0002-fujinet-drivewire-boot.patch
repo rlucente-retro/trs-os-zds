@@ -8,8 +8,8 @@ Phase 1 Deliverables:
 - Replace in-memory slice scanning in ipl-BIOS.s with direct DriveWire network boot of Drive :0
 - Route ipl-DOS.S auto-boot directly into default TRSDOS IPL (TRSDOS Ready prompt)
 
---- TRSDOS_GLOBAL/equates/equates-global-lowcore.s	2026-01-09 11:12:22
-+++ TRSDOS_GLOBAL/equates/equates-global-lowcore.s	2026-10-26 20:23:37
+--- a/TRSDOS_GLOBAL/equates/equates-global-lowcore.s	2026-01-09 11:12:22
++++ b/TRSDOS_GLOBAL/equates/equates-global-lowcore.s	2026-10-26 20:23:37
 @@ -216,6 +216,12 @@
  	XDEF		ramdrv$
  	XDEF		reboot
@@ -23,8 +23,8 @@ Phase 1 Deliverables:
  
  ; eZ80 associated xdef's.
  
---- TRSDOS_7/SYSRES/drivers/driver-FDCDVR.S	2026-10-13 20:01:22
-+++ TRSDOS_7/SYSRES/drivers/driver-FDCDVR.S	2026-10-26 20:48:10
+--- a/TRSDOS_7/SYSRES/drivers/driver-FDCDVR.S	2026-10-13 20:01:22
++++ b/TRSDOS_7/SYSRES/drivers/driver-FDCDVR.S	2026-10-26 20:48:10
 @@ -31,7 +31,13 @@
  rd_retries	db	0
  wr_retries	db	0
@@ -297,8 +297,8 @@ Phase 1 Deliverables:
 +
  FDCEND:		EQU	$-1
 \ No newline at end of file
---- TRSDOS_7/SYS0_IPL/ipl-BIOS.s	2026-01-17 18:00:42
-+++ TRSDOS_7/SYS0_IPL/ipl-BIOS.s	2026-10-26 20:45:04
+--- a/TRSDOS_7/SYS0_IPL/ipl-BIOS.s	2026-01-17 18:00:42
++++ b/TRSDOS_7/SYS0_IPL/ipl-BIOS.s	2026-10-26 20:45:04
 @@ -41,101 +41,68 @@
  
  pastshawn	PUMP	DEVICE.console,splashiplmode	; Report CPU registers initialized.
@@ -744,8 +744,8 @@ Phase 1 Deliverables:
  
  ; Delay a bit and allow copyright splash to be read.
  
---- TRSDOS_7/SYS0_IPL/ipl-DOS.S	2026-10-10 11:20:40
-+++ TRSDOS_7/SYS0_IPL/ipl-DOS.S	2026-10-26 21:41:58
+--- a/TRSDOS_7/SYS0_IPL/ipl-DOS.S	2026-10-10 11:20:40
++++ b/TRSDOS_7/SYS0_IPL/ipl-DOS.S	2026-10-26 21:41:58
 @@ -76,9 +76,7 @@
  		call query_server		; Get server parameters.
  		call bind_server		; Bind server & client (me).
