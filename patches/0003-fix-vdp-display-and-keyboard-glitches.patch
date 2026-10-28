@@ -1,6 +1,6 @@
-Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and boot loops
+Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and persistent cursor
 
-1. driver-uart0.s:
+1. driver-UART0.S:
    - Add VDP binary packet decoder: filters out VDP metadata packets (0x86
      PACKET_MODE, 0x89 PACKET_MOUSE, etc.) to prevent packet payloads from
      being misinterpreted as ASCII keystrokes (e.g. 0x50 'P').
@@ -8,12 +8,14 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and boot loo
      through to @KEYIN while discarding releases and non-ASCII modifiers.
    - Adds one-time startup FIFO drain on first CKINP call to discard stale
      packets queued by Quark MOS, loadfont, and OSboot.
+   - Calls hide_vdp_cursor on first CKINP call using TXUART0 flow control to send
+     VT100 ESC [ ? 25 l and Agon VDU cursor suppression sequences to eliminate the
+     persistent blinking block cursor.
    - Changes CTLUART0 relative jumps to absolute jumps to avoid branch range errors.
 
-2. ipl-strings.s & memory_video.s:
-   - Replaces VT100 ANSI escape codes (ESC [ J, ESC [ f, ESC [ ? 25 l) with
-     native Agon BBC VDU control codes (VDU 12 for CLS, VDU 30 for Home Cursor).
-   - Preserves exact 4-byte and 9-byte structure sizes.
+2. ipl-strings.s:
+   - Updates vt100_clear$ to include ESC [ ? 25 l and CLS (12).
+   - Updates vt100_home$ to include ESC [ f and VDU 30.
 
 3. ipl_sessions.s & ipl-trsdos.s:
    - Ensures realtim session initializes session_cmd$ with spaces instead of
@@ -22,10 +24,10 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and boot loo
 
 4. interrupt_handler.s:
    - Fixes video buffer pump length from CRTSIZE+2 to CRTSIZE+9 so all 1920
-     video RAM bytes are refreshed across UART0 without truncation.
+     video RAM bytes are refreshed across UART0 along with the 9-byte prefix.
 
---- a/TRSDOS_7/SYSRES/drivers/driver-uart0.s
-+++ b/TRSDOS_7/SYSRES/drivers/driver-uart0.s
+--- a/TRSDOS_7/SYSRES/drivers/driver-UART0.S
++++ b/TRSDOS_7/SYSRES/drivers/driver-UART0.S
 @@ -41,9 +41,9 @@
  
  CTLUART0	LD	A,C			; Get @CTL byte
@@ -66,10 +68,11 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and boot loo
  		ld	a,(esccount)
  		jr	nz,resetesc
  		dec	a
-@@ -247,6 +255,65 @@
+@@ -246,6 +254,89 @@
+ 		ld	a,c
  		cp	A			; Set Z flag.
  		ret
- 
++
 +; VDP Packet Handler for Agon Light / Fab Agon Emulator
 +; VDP packets: [0x80+code] [len] [payload...]
 +; Packet 0x81 (PACKET_KEYCODE): len=4, payload=[ascii, modifiers, vk_code, is_down]
@@ -124,14 +127,37 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and boot loo
 +		LD	A,B
 +		OR	C
 +		JR	NZ,fu0_wait
++		CALL	hide_vdp_cursor
 +		POP	BC
 +		RET
 +fu0_read	IN0	A,(UART0_RBR)
 +		JR	fu0_loop
 +
++; Agon VDP: send cursor-off sequence directly to UART0
++hide_vdp_cursor	PUSH	HL
++		PUSH	AF
++		PUSH	BC
++		LD	HL,vdu_cur_off_seq
++hvc_loop	LD	A,(HL)
++		INC	HL
++		CP	0FFh
++		JR	Z,hvc_done
++		LD	C,A
++		CALL	TXUART0
++		JR	hvc_loop
++hvc_done	POP	BC
++		POP	AF
++		POP	HL
++		RET
++
++vdu_cur_off_seq	db	ESC.asc, "[?25l"	; VT100: Hide cursor in fabgl::Terminal
++		db	23, 1, 0		; Agon VDU: disable text cursor
++		db	23, 0, 10, 32		; Agon VDU: CRTC reg 10 cursor off
++		db	23, 0, 11, 0		; Agon VDU: CRTC reg 11 cursor end=0
++		db	0FFh			; End of sequence
+ 
  ; Character PUT request. Transmit byte in register C.
  
- TXUART0:	call	CANISND
 --- a/TRSDOS_7/SYS0_IPL/ipl-strings.s
 +++ b/TRSDOS_7/SYS0_IPL/ipl-strings.s
 @@ -42,8 +42,8 @@
@@ -140,8 +166,8 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and boot loo
  safeipl$	db	"n",CR.asc
 -vt100_clear$	db	ESC.asc,"[J",ETX.asc			; Clear video screen.
 -vt100_home$	DB	ESC.asc,"[f",ETX.asc			; Cursor to home position.
-+vt100_clear$	db	12,0,0,ETX.asc			; Agon VDP: 12=CLS
-+vt100_home$	DB	30,0,0,ETX.asc			; Agon VDP: 30=Home Cursor
++vt100_clear$	db	ESC.asc,"[?25l",12,23,1,0,ETX.asc			; Agon / Terminal: Hide cursor & CLS
++vt100_home$	DB	ESC.asc,"[f",30,ETX.asc			; Agon / Terminal: Home Cursor
  
  quiet_default	dw	0					; Default value for IPL in quiet mode.
  
@@ -167,18 +193,6 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and boot loo
  
  		ld	a,(session_cmd$)			; Get 1st char.
  		cp	' '					; No command?
---- a/TRSDOS_7/SYSRES/memory/memory_video.s
-+++ b/TRSDOS_7/SYSRES/memory/memory_video.s
-@@ -1,7 +1,7 @@
- 
- 			org	zspace.VIDEO$-9				; Video control codes resides here.
--			db	ESC.asc,"[f"				; Cursor to home position.
--			db	ESC.asc,"[?25l" 
-+			db	30,0,0					; Agon VDP: 30=Home Cursor
-+			db	0,0,0,0,0,0
- 
- 			org	zspace.VIDEO$				; Video RAM resides here.
- 			db	"Copyright 2024 Daniel Paul Martin, All rights reserved."
 --- a/TRSDOS_7/SYSRES/interrupts/interrupt_handler.s
 +++ b/TRSDOS_7/SYSRES/interrupts/interrupt_handler.s
 @@ -62,7 +62,7 @@
