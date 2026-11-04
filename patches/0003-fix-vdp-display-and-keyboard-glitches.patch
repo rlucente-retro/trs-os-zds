@@ -1,6 +1,16 @@
-Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and persistent cursor
+Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and Break polling
 
-1. driver-UART0.S:
+1. driver-DODVR.S:
+   - Replaces DI with NOP in DO_RET1, zVDCTL3, and z_VDCTL so interrupts remain
+     enabled during character display and cursor operations. On Agon Light 2,
+     video memory is pumped across UART0 by the 60 Hz timer interrupt; leaving
+     interrupts disabled causes tight program loops (e.g. BASIC RUN) to starve
+     timer interrupts, preventing screen refresh and locking up the system.
+
+2. driver-UART0.S:
+   - Removes UART0_MSR CTS polling in CANISND (replacing with NOPs). Agon Light 2
+     does not connect hardware CTS on UART0, and in the emulator CTS deasserts
+     when buffers are full, freezing transmission.
    - Add VDP binary packet decoder: filters out VDP metadata packets (0x86
      PACKET_MODE, 0x89 PACKET_MOUSE, etc.) to prevent packet payloads from
      being misinterpreted as ASCII keystrokes (e.g. 0x50 'P').
@@ -13,21 +23,92 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and persiste
      persistent blinking block cursor.
    - Changes CTLUART0 relative jumps to absolute jumps to avoid branch range errors.
 
-2. ipl-strings.s:
+3. ipl-strings.s:
    - Updates vt100_clear$ to include ESC [ ? 25 l and CLS (12).
    - Updates vt100_home$ to include ESC [ f and VDU 30.
 
-3. ipl_sessions.s & ipl-trsdos.s:
+4. ipl_sessions.s & ipl-trsdos.s:
    - Ensures realtim session initializes session_cmd$ with spaces instead of
      "cls", allowing clean IPL exit via SYS_EXIT 0 to the command prompt.
    - Sets initial cursor location to row 0, col 0.
 
-4. interrupt_handler.s:
+5. interrupt_handler.s:
    - Fixes video buffer pump length from CRTSIZE+2 to CRTSIZE+9 so all 1920
      video RAM bytes are refreshed across UART0 along with the 9-byte prefix.
+   - Removes UART0_MSR CTS polling in canisend1 (replacing with NOPs) to prevent
+     infinite wait on unrouted CTS in the 60 Hz timer interrupt handler.
 
---- a/TRSDOS_7/SYSRES/drivers/driver-UART0.S
-+++ b/TRSDOS_7/SYSRES/drivers/driver-UART0.S
+6. scan-kflag.s:
+   - Replaces legacy TRS-80 memory-mapped keyboard matrix scanning (0xF440, KB7)
+     with UART0 polling via CKINP, allowing TSTBRK during the 60 Hz timer
+     interrupt to detect Break / Ctrl-C (0x03) and break out of running BASIC loops.
+
+--- a/TRSDOS_7/SYS0_IPL/ipl-strings.s	2026-11-04 16:50:32
++++ b/TRSDOS_7/SYS0_IPL/ipl-strings.s	2026-11-04 16:53:53
+@@ -38,8 +38,8 @@
+ initialflg	db	0
+ score		db	0
+ safeipl$	db	"n",CR.asc
+-vt100_clear$	db	ESC.asc,"[J",ETX.asc			; Clear video screen.
+-vt100_home$	DB	ESC.asc,"[f",ETX.asc			; Cursor to home position.
++vt100_clear$	db	ESC.asc,"[?25l",12,23,1,0,ETX.asc			; Agon / Terminal: Hide cursor & CLS
++vt100_home$	DB	ESC.asc,"[f",30,ETX.asc			; Agon / Terminal: Home Cursor
+ 
+ quiet_default	dw	0					; Default value for IPL in quiet mode.
+ 
+--- a/TRSDOS_7/SYS0_IPL/ipl-trsdos.s	2026-11-04 16:50:32
++++ b/TRSDOS_7/SYS0_IPL/ipl-trsdos.s	2026-11-04 16:53:53
+@@ -43,7 +43,7 @@
+ no_auto		PUMP	DEVICE.console,vt100_home$		; Cursor upper left corner.
+ 		PUMP	DEVICE.console,vt100_clear$		; Clear video screen on terminal...make nice clean.
+ 		
+-		locate.CURSOR 22,0
++		locate.CURSOR 0,0
+ 
+ 		ld	a,(session_cmd$)			; Get 1st char.
+ 		cp	' '					; No command?
+--- a/TRSDOS_7/SYS0_IPL/ipl_sessions.s	2026-11-04 16:50:32
++++ b/TRSDOS_7/SYS0_IPL/ipl_sessions.s	2026-11-04 16:53:53
+@@ -55,7 +55,7 @@
+ 		ret
+ realtim		ld	a,4
+ 		ld	(quiet_default_flg),a
+-		MVC	realtim$,session_cmd$,15
++		MVC	defltterm$,session_cmd$,15
+ 		xor	a				; A=0 or NOP.
+ 		ld	(pump_switch_value),a		; Enable pump switch, this updates display in real time.
+ 		ret
+--- a/TRSDOS_7/SYSRES/drivers/driver-DODVR.S	2026-11-04 16:50:32
++++ b/TRSDOS_7/SYSRES/drivers/driver-DODVR.S	2026-11-04 16:53:39
+@@ -49,7 +49,7 @@
+ DONORM			CALL    DO_DSPCHAR    	  		;Display the char
+ 			RES     CTL,(IX+DO_MASK)	 	;Turn off CTL bit
+ DO_RET  		POP    	BC              		;Get orig char
+-DO_RET1 		DI		                      	;Disable intr
++DO_RET1 		NOP		                      	;Keep interrupts enabled
+ 			LD     	A,(CRSAVE)      		;If a cursor is on, then
+ 			OR     	A          		     	;we need to save the
+ 			JR     	Z,$?1           		;current char & display
+@@ -323,7 +323,7 @@
+ 
+ zVDCTL3	 		CALL    	ROWCOL_2_ADDR   		;Calculate video address
+ 			RET     	NZ          		    	;Back on error
+-			DI              	        		;Disable any video tasks
++			NOP              	        		;Keep interrupts enabled
+ 			LD      	(CURSOR),DE     		;until cursor is updated
+ 			RET
+ 
+@@ -343,7 +343,7 @@
+ 			PUSH    	DE	
+ 			CALL    	VDCTL   	       		 ;Do function request
+ 			PUSH    	AF      	    		 ;Save the error status
+-			DI              				 ;Stop video tasks tempy
++			NOP              				 ;Keep interrupts enabled
+ 			LD      	DE,(CURSOR)
+ 			CALL    	DO_RET1 	   		 ;Normalize screen and cursor
+ 			POP     	AF
+--- a/TRSDOS_7/SYSRES/drivers/driver-UART0.S	2026-11-04 16:50:32
++++ b/TRSDOS_7/SYSRES/drivers/driver-UART0.S	2026-11-04 16:53:53
 @@ -41,9 +41,9 @@
  
  CTLUART0	LD	A,C			; Get @CTL byte
@@ -40,7 +121,24 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and persiste
  		DEC	A
  		JR	Z,CTL2			; CTL 02 "init uart"
  		CP	4-2			; Wakeup feature?
-@@ -186,7 +186,13 @@
+@@ -86,9 +86,13 @@
+ 		
+ ;	Check if ready to send
+ 
+-CANISND		IN0	a,(UART0_MSR)		; Get CTS status & test if CTS is ready..
+-		BIT	4,A			; If other end sets CTS true, they are ready to receive.I just
+-		JR	Z,CANISND		; If not ready wait. Come on I am waiting in CANISND loop.
++CANISND		nop
++		nop
++		nop
++		nop
++		nop
++		nop
++		nop
+ 	
+ 		IN0	A,(UART0_LSR)		; Find out if UART ready to transmit.
+ 		cpl
+@@ -186,7 +190,13 @@
  		ld	a,0			; A=0 No error.
  		ret
  
@@ -55,7 +153,7 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and persiste
  		AND     UART_DR     		; Char waiting?
  		JR      Z,nochar		; Make NZ, NO char waiting.
  			
-@@ -201,9 +207,11 @@
+@@ -201,9 +211,11 @@
  		;ld	b,00000000b		; Set TRS-80 modem status register to char waiting.
  
  		IN0    	A,(UART0_RBR)		; Get byte from UART0.
@@ -68,7 +166,7 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and persiste
  		ld	a,(esccount)
  		jr	nz,resetesc
  		dec	a
-@@ -246,6 +254,89 @@
+@@ -246,6 +258,89 @@
  		ld	a,c
  		cp	A			; Set Z flag.
  		ret
@@ -158,49 +256,89 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and persiste
  
  ; Character PUT request. Transmit byte in register C.
  
---- a/TRSDOS_7/SYS0_IPL/ipl-strings.s
-+++ b/TRSDOS_7/SYS0_IPL/ipl-strings.s
-@@ -42,8 +42,8 @@
- initialflg	db	0
- score		db	0
- safeipl$	db	"n",CR.asc
--vt100_clear$	db	ESC.asc,"[J",ETX.asc			; Clear video screen.
--vt100_home$	DB	ESC.asc,"[f",ETX.asc			; Cursor to home position.
-+vt100_clear$	db	ESC.asc,"[?25l",12,23,1,0,ETX.asc			; Agon / Terminal: Hide cursor & CLS
-+vt100_home$	DB	ESC.asc,"[f",30,ETX.asc			; Agon / Terminal: Home Cursor
- 
- quiet_default	dw	0					; Default value for IPL in quiet mode.
- 
---- a/TRSDOS_7/SYS0_IPL/ipl_sessions.s
-+++ b/TRSDOS_7/SYS0_IPL/ipl_sessions.s
-@@ -55,7 +55,7 @@
- 		ret
- realtim		ld	a,4
- 		ld	(quiet_default_flg),a
--		MVC	realtim$,session_cmd$,15
-+		MVC	defltterm$,session_cmd$,15
- 		xor	a				; A=0 or NOP.
- 		ld	(pump_switch_value),a		; Enable pump switch, this updates display in real time.
- 		ret
---- a/TRSDOS_7/SYS0_IPL/ipl-trsdos.s
-+++ b/TRSDOS_7/SYS0_IPL/ipl-trsdos.s
-@@ -43,7 +43,7 @@
- no_auto		PUMP	DEVICE.console,vt100_home$		; Cursor upper left corner.
- 		PUMP	DEVICE.console,vt100_clear$		; Clear video screen on terminal...make nice clean.
- 		
--		locate.CURSOR 22,0
-+		locate.CURSOR 0,0
- 
- 		ld	a,(session_cmd$)			; Get 1st char.
- 		cp	' '					; No command?
---- a/TRSDOS_7/SYSRES/interrupts/interrupt_handler.s
-+++ b/TRSDOS_7/SYSRES/interrupts/interrupt_handler.s
-@@ -62,7 +62,7 @@
+--- a/TRSDOS_7/SYSRES/interrupts/interrupt_handler.s	2026-11-04 16:50:32
++++ b/TRSDOS_7/SYSRES/interrupts/interrupt_handler.s	2026-11-04 16:53:53
+@@ -62,11 +62,15 @@
  			ld	(pumpcnt),a		; Reset counter to countdown value.
  
  			ld	hl,zspace.VIDEO$-9	; Point to video RAM.
 -			ld	de,CRTSIZE+2		; Size of video screen in dec (1920).
 +			ld	de,CRTSIZE+9		; Size of video screen + 9 prefix bytes.
  
- canisend1		IN0	a,(UART0_MSR)		; Get CTS status & test if CTS is ready..
- 			BIT	4,A			; If other end sets CTS true, they are ready to receive.I just
+-canisend1		IN0	a,(UART0_MSR)		; Get CTS status & test if CTS is ready..
+-			BIT	4,A			; If other end sets CTS true, they are ready to receive.I just
+-			JR	Z,canisend1		; If not ready wait. Come on I am waiting in CANISND loop.
++canisend1	nop
++			nop
++			nop
++			nop
++			nop
++			nop
++			nop
+ 
+ 			IN0	A,(UART0_LSR)		; Find out if UART ready to transmit.
+ 			cpl
+--- a/TRSDOS_7/SYSRES/lowcore/scan-kflag.s
++++ b/TRSDOS_7/SYSRES/lowcore/scan-kflag.s
+@@ -1,43 +1,19 @@
+-; Scan for PAUSE or BREAK & set KFLAG$.
++; Scan for BREAK & update KFLAG$.
+ 
+-KCKz		nop
+-		nop
+-		nop	;	CALL	ENADIS_DO_RAM	; Bring up the keyboard
++KCKz		PUSH	BC
++		PUSH	DE
++		PUSH	IX
++		LD	IX,CLDATA$
++		CALL	CKINP
++		POP	IX
++		POP	DE
++		POP	BC
+ 		LD	HL,KFLAG$	; Hang onto flag
+-		LD	A,(SHIFT)	; P/u SHIFT row & ignore
+-		AND	7		; CTRL key pressed
+-		CPL
+-		BIT	2,A		
+-		RET	Z		; Back if CTRL
+-
+-; Set carry flag if a SHIFT key is down
+-
+-		ADD	A,1		; Set CF if no SHIFT
+-		CCF			; Set CF if SHIFT
+-		JR	NC,KCK1		; No pause if no SHIFT
+-		LD	A,(KB1)		; Test for "z"
+-;		IF	zUSA
+-		BIT	0,A
+-		JR	Z,KCK1A		; Bypass if no "z"
+-		SET	1,(HL)		; Turn on pause bit
+-		JR	KCK1A
+-
+-; Inhibit test of unshifted BREAK if nested ENA_DO
+-
+-KCK1		LD	A,(OPREG_SV_PTR)	; If not at highest level
+-		SUB	OPREG_SV_AREA+1&0FFh 	; then don"t allow
+-		JR	NZ,KCK1B		; tasker BREAK handler
+-KCK1A		LD	A,(KB7)			; Check on BREAK & ENTER
+-		BIT	0,A			; Check on ENTER
+-		JR	Z,KCK1B			; Go if not
+-		SET	2,(HL)			; else note set
+-KCK1B		BIT	2,A			; Is <BREAK> depressed?
+-		PUSH	AF
+-		JR	Z,KCK2			; Go if not
+-		JR	C,KCK2			; Ignore if shifted
+-		LD	A,(SFLAG$)		; Permit break bit only
+-		BIT	4,A			; if BREAK enabled?
+-		JR	NZ,KCK2
+-		SET	0,(HL)			; Turn on BREAK bit
+-KCK2		POP	AF			; C=shift, NZ=break
+-		RET
+\ No newline at end of file
++		BIT	0,(HL)		; Break bit set?
++		JR	NZ,kck_brk
++		XOR	A		; Return Z=1 (no break), CY=0
++		RET
++kck_brk		RES	0,(HL)		; Reset bit so it triggers once
++		LD	A,1
++		OR	A		; Return NZ (break), CY=0 (NC)
++		RET
