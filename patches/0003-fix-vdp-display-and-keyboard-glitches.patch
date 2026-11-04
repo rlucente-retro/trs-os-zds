@@ -14,8 +14,13 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and Break po
    - Add VDP binary packet decoder: filters out VDP metadata packets (0x86
      PACKET_MODE, 0x89 PACKET_MOUSE, etc.) to prevent packet payloads from
      being misinterpreted as ASCII keystrokes (e.g. 0x50 'P').
-   - Handles 0x81 PACKET_KEYCODE, passing valid pressed ASCII characters
-     through to @KEYIN while discarding releases and non-ASCII modifiers.
+   - Handles 0x81 PACKET_KEYCODE dynamically for 2-byte or 4-byte payloads:
+     decodes ASCII keystrokes, Ctrl-C, Escape, and Pause without stalling on
+     shorter payloads.
+   - Maps both Escape (0x1B) and Ctrl-C (0x03) to Break (setting KFLAG$ bit 0
+     and returning 80h in CLBUF), removing esccount countdown and hard zABORT
+     task exit to prevent abrupt termination back to DOS.
+   - Adds timeout loop in u0_gb to prevent infinite busy-wait in interrupt handlers.
    - Adds one-time startup FIFO drain on first CKINP call to discard stale
      packets queued by Quark MOS, loadfont, and OSboot.
    - Calls hide_vdp_cursor on first CKINP call using TXUART0 flow control to send
@@ -41,10 +46,13 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and Break po
 6. scan-kflag.s:
    - Replaces legacy TRS-80 memory-mapped keyboard matrix scanning (0xF440, KB7)
      with UART0 polling via CKINP, allowing TSTBRK during the 60 Hz timer
-     interrupt to detect Break / Ctrl-C (0x03) and break out of running BASIC loops.
+     interrupt to detect Break / Ctrl-C (0x03) and Break without consuming/clearing
+     KFLAG$ bit 0 so that BASIC's @CKBRKC can trap the Break and return to the
+     Ready prompt without exiting to DOS.
 
---- a/TRSDOS_7/SYS0_IPL/ipl-strings.s	2026-11-04 16:50:32
-+++ b/TRSDOS_7/SYS0_IPL/ipl-strings.s	2026-11-04 16:53:53
+diff -ruN TRSDOS_7_base/SYS0_IPL/ipl-strings.s TRSDOS_7/SYS0_IPL/ipl-strings.s
+--- a/TRSDOS_7/SYS0_IPL/ipl-strings.s	2026-11-04 18:23:31
++++ b/TRSDOS_7/SYS0_IPL/ipl-strings.s	2026-11-04 18:23:31
 @@ -38,8 +38,8 @@
  initialflg	db	0
  score		db	0
@@ -56,8 +64,9 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and Break po
  
  quiet_default	dw	0					; Default value for IPL in quiet mode.
  
---- a/TRSDOS_7/SYS0_IPL/ipl-trsdos.s	2026-11-04 16:50:32
-+++ b/TRSDOS_7/SYS0_IPL/ipl-trsdos.s	2026-11-04 16:53:53
+diff -ruN TRSDOS_7_base/SYS0_IPL/ipl-trsdos.s TRSDOS_7/SYS0_IPL/ipl-trsdos.s
+--- a/TRSDOS_7/SYS0_IPL/ipl-trsdos.s	2026-11-04 18:23:31
++++ b/TRSDOS_7/SYS0_IPL/ipl-trsdos.s	2026-11-04 18:23:31
 @@ -43,7 +43,7 @@
  no_auto		PUMP	DEVICE.console,vt100_home$		; Cursor upper left corner.
  		PUMP	DEVICE.console,vt100_clear$		; Clear video screen on terminal...make nice clean.
@@ -67,8 +76,9 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and Break po
  
  		ld	a,(session_cmd$)			; Get 1st char.
  		cp	' '					; No command?
---- a/TRSDOS_7/SYS0_IPL/ipl_sessions.s	2026-11-04 16:50:32
-+++ b/TRSDOS_7/SYS0_IPL/ipl_sessions.s	2026-11-04 16:53:53
+diff -ruN TRSDOS_7_base/SYS0_IPL/ipl_sessions.s TRSDOS_7/SYS0_IPL/ipl_sessions.s
+--- a/TRSDOS_7/SYS0_IPL/ipl_sessions.s	2026-11-04 18:23:31
++++ b/TRSDOS_7/SYS0_IPL/ipl_sessions.s	2026-11-04 18:23:31
 @@ -55,7 +55,7 @@
  		ret
  realtim		ld	a,4
@@ -78,8 +88,9 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and Break po
  		xor	a				; A=0 or NOP.
  		ld	(pump_switch_value),a		; Enable pump switch, this updates display in real time.
  		ret
---- a/TRSDOS_7/SYSRES/drivers/driver-DODVR.S	2026-11-04 16:50:32
-+++ b/TRSDOS_7/SYSRES/drivers/driver-DODVR.S	2026-11-04 16:53:39
+diff -ruN TRSDOS_7_base/SYSRES/drivers/driver-DODVR.S TRSDOS_7/SYSRES/drivers/driver-DODVR.S
+--- a/TRSDOS_7/SYSRES/drivers/driver-DODVR.S	2026-11-04 18:23:31
++++ b/TRSDOS_7/SYSRES/drivers/driver-DODVR.S	2026-11-04 18:23:31
 @@ -49,7 +49,7 @@
  DONORM			CALL    DO_DSPCHAR    	  		;Display the char
  			RES     CTL,(IX+DO_MASK)	 	;Turn off CTL bit
@@ -107,8 +118,9 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and Break po
  			LD      	DE,(CURSOR)
  			CALL    	DO_RET1 	   		 ;Normalize screen and cursor
  			POP     	AF
---- a/TRSDOS_7/SYSRES/drivers/driver-UART0.S	2026-11-04 16:50:32
-+++ b/TRSDOS_7/SYSRES/drivers/driver-UART0.S	2026-11-04 16:53:53
+diff -ruN TRSDOS_7_base/SYSRES/drivers/driver-UART0.S TRSDOS_7/SYSRES/drivers/driver-UART0.S
+--- a/TRSDOS_7/SYSRES/drivers/driver-UART0.S	2026-11-04 18:23:31
++++ b/TRSDOS_7/SYSRES/drivers/driver-UART0.S	2026-11-04 18:26:17
 @@ -41,9 +41,9 @@
  
  CTLUART0	LD	A,C			; Get @CTL byte
@@ -153,7 +165,7 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and Break po
  		AND     UART_DR     		; Char waiting?
  		JR      Z,nochar		; Make NZ, NO char waiting.
  			
-@@ -201,9 +211,11 @@
+@@ -201,22 +211,11 @@
  		;ld	b,00000000b		; Set TRS-80 modem status register to char waiting.
  
  		IN0    	A,(UART0_RBR)		; Get byte from UART0.
@@ -162,18 +174,63 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and Break po
  		LD	C,A			; Save it in C.
  			
 -		cp	ESC.asc			; User hit escape? If so inc count by 1.
-+norm_char	cp	ESC.asc			; User hit escape? If so inc count by 1.
- 		ld	a,(esccount)
- 		jr	nz,resetesc
- 		dec	a
-@@ -246,6 +258,89 @@
+-		ld	a,(esccount)
+-		jr	nz,resetesc
+-		dec	a
+-		jr	nz,CRCK			; Have not reached 0 yet.
+-		ld	a,2			; Reset counter to 2.
+-		ld	(esccount),a
+-		jp	zABORT			; Two counts....were out of here!
+-			
+-; Break, Pause and Enter handler routine.
+-
+-resetesc	ld	a,2			; Reset counter back to 2.
+-CRCK		ld	(esccount),a
+-		ld	a,c
++norm_char	ld	a,c
+ 		LD	HL,zKFLAG$		; KFLAG$
+ 		CP	CR.asc			; ENTER char received?
+ 		JR	NZ,PAWSCK		; Go if not
+@@ -226,26 +225,168 @@
+ 		JR	NZ,BRKCHK		; Go if not
+ 		SET	1,(HL)			; Set pause bit
+ 		JR	RECVEX
+-BRKCHK		LD	A,(IX+LOGBRK)		; Break char received?
+-		OR	A			; Check if LOGBRK=0
+-		JR	Z,RECVEX		; No valid break if =0
+-		CP	C			; Check if a valid break
+-		JR	NZ,RECVEX		; Go if so.
++BRKCHK		CP	ESC.asc			; Escape (<Break>)?
++		JR	Z,BRKRECD
++		CP	03H			; Ctrl-C?
++		JR	Z,BRKRECD
++		CP	(IX+LOGBRK)		; Logical break char?
++		JR	Z,BRKRECD
++		JR	RECVEX			; Else normal character
+ 
+ ; A break was received, check system's BREAK disable
+ 
+-BRKRECD		LD	A,(zSFLAG$)		; Check if break key.
++BRKRECD		LD	A,(zSFLAG$)		; Check if break key
+ 		AND	10H			; is disabled
+ 		LD	A,00H			; Ret NZ & A=0 if
+ 		RET	NZ			; the BREAK is disabled
+ 		LD	HL,zKFLAG$		; Hang onto flag
+-		SET	0,(HL)			; Else set break bit
+-		LD	C,80H			; & reset BREAK code
++		SET	0,(HL)			; Set break bit
++		LD	C,80H			; & return TRS-80 BREAK code (80h)
+ RECVEX		LD	(IX+CLBUF),C		; Put char in 1 char buf
+ 		LD	(IX+CLFLG),80H		; Set char available
  		ld	a,c
  		cp	A			; Set Z flag.
  		ret
 +
 +; VDP Packet Handler for Agon Light / Fab Agon Emulator
 +; VDP packets: [0x80+code] [len] [payload...]
-+; Packet 0x81 (PACKET_KEYCODE): len=4, payload=[ascii, modifiers, vk_code, is_down]
++; Packet 0x81 (PACKET_KEYCODE): len=2 or len=4
++;   len=2: payload=[ascii, 0]
++;   len=4: payload=[ascii, modifiers, vk_code, is_down]
 +; All other packets (e.g. 0x86 PACKET_MODE, 0x89 PACKET_MOUSE) are discarded.
 +
 +vdp_pkt		PUSH	DE
@@ -184,18 +241,66 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and Break po
 +		CP	81h			; Is it PACKET_KEYCODE?
 +		JR	NZ,vdp_discard
 +
-+		CALL	u0_gb			; Byte 1: ascii
-+		LD	D,A			; Save ascii in D
-+		CALL	u0_gb			; Byte 2: modifiers
-+		CALL	u0_gb			; Byte 3: vk_code
-+		CALL	u0_gb			; Byte 4: is_down
-+		OR	A			; Key pressed? (1=press, 0=release)
-+		JR	Z,vdp_next		; Ignore key release
-+		LD	A,D			; A = ascii
-+		OR	A			; Valid character?
-+		JR	Z,vdp_next		; Ignore non-ascii modifier
-+		POP	DE
-+		LD	C,A			; Character in C
++		LD	A,E
++		OR	A
++		JR	Z,vdp_next		; Empty payload
++
++		; Read Byte 1: ascii
++		CALL	u0_gb
++		LD	C,A			; C = ascii
++		DEC	E
++		JR	Z,vdp_eval		; Length 1
++
++		; Read Byte 2: modifiers
++		CALL	u0_gb
++		LD	D,A			; D = modifiers
++		DEC	E
++		JR	Z,vdp_eval		; Length 2 (sendKeycodeByte: [ascii, 0])
++
++		; Read Byte 3: vk_code
++		CALL	u0_gb
++		LD	B,A			; B = vk_code
++		DEC	E
++		JR	Z,vdp_eval		; Length 3
++
++		; Read Byte 4: is_down
++		CALL	u0_gb
++		DEC	E
++		PUSH	AF			; Save is_down
++
++		; Drain any remaining bytes (if E > 0)
++vdp_drn_lp	LD	A,E
++		OR	A
++		JR	Z,vdp_drn_dn
++		CALL	u0_gb
++		DEC	E
++		JR	vdp_drn_lp
++vdp_drn_dn	POP	AF			; Restore is_down
++		OR	A			; Pressed (1) or released (0)?
++		JR	Z,vdp_next		; Ignore key release!
++
++vdp_eval	; Character in C, modifiers in D, vk_code in B
++		LD	A,C
++		OR	A			; Is ASCII non-zero?
++		JR	NZ,vdp_has_char		; Valid ASCII character!
++
++		; ASCII is 0: check if Ctrl+C or Escape was pressed
++		LD	A,B			; Virtual key code
++		CP	1Bh			; VK_ESCAPE
++		JR	Z,vdp_is_esc
++		RES	5,A			; 'c' -> 'C'
++		CP	'C'
++		JR	NZ,vdp_next		; Not 'c' or 'C'
++		INC	D
++		DEC	D			; Modifiers active?
++		JR	Z,vdp_next		; Bare 'c' with ascii=0
++		LD	C,03h			; Synthesize Ctrl-C
++		JR	vdp_has_char
++
++vdp_is_esc	LD	C,1Bh			; Synthesize Escape
++		JR	vdp_has_char
++
++vdp_has_char	POP	DE
 +		JP	norm_char
 +
 +vdp_discard	LD	A,E
@@ -208,10 +313,17 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and Break po
 +vdp_next	POP	DE
 +		JP	CKINP
 +
-+u0_gb		IN0	A,(UART0_LSR)
++u0_gb		PUSH	BC
++		LD	B,0			; Timeout loop counter (256 iterations)
++u0_gblp		IN0	A,(UART0_LSR)
 +		AND	UART_DR
-+		JR	Z,u0_gb
-+		IN0	A,(UART0_RBR)
++		JR	NZ,u0_gbok
++		DJNZ	u0_gblp
++		POP	BC
++		XOR	A			; Timeout: return 0
++		RET
++u0_gbok		IN0	A,(UART0_RBR)
++		POP	BC
 +		RET
 +
 +u0_flushed_flg	db	0			; 0=not flushed yet, 1=flushed
@@ -256,8 +368,9 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and Break po
  
  ; Character PUT request. Transmit byte in register C.
  
---- a/TRSDOS_7/SYSRES/interrupts/interrupt_handler.s	2026-11-04 16:50:32
-+++ b/TRSDOS_7/SYSRES/interrupts/interrupt_handler.s	2026-11-04 16:53:53
+diff -ruN TRSDOS_7_base/SYSRES/interrupts/interrupt_handler.s TRSDOS_7/SYSRES/interrupts/interrupt_handler.s
+--- a/TRSDOS_7/SYSRES/interrupts/interrupt_handler.s	2026-11-04 18:23:31
++++ b/TRSDOS_7/SYSRES/interrupts/interrupt_handler.s	2026-11-04 18:23:31
 @@ -62,11 +62,15 @@
  			ld	(pumpcnt),a		; Reset counter to countdown value.
  
@@ -278,9 +391,10 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and Break po
  
  			IN0	A,(UART0_LSR)		; Find out if UART ready to transmit.
  			cpl
---- a/TRSDOS_7/SYSRES/lowcore/scan-kflag.s
-+++ b/TRSDOS_7/SYSRES/lowcore/scan-kflag.s
-@@ -1,43 +1,19 @@
+diff -ruN TRSDOS_7_base/SYSRES/lowcore/scan-kflag.s TRSDOS_7/SYSRES/lowcore/scan-kflag.s
+--- a/TRSDOS_7/SYSRES/lowcore/scan-kflag.s	2026-11-04 18:23:31
++++ b/TRSDOS_7/SYSRES/lowcore/scan-kflag.s	2026-11-04 18:24:07
+@@ -1,43 +1,14 @@
 -; Scan for PAUSE or BREAK & set KFLAG$.
 +; Scan for BREAK & update KFLAG$.
  
@@ -332,13 +446,7 @@ Subject: [PATCH] Fix Agon VDP display glitches, phantom keystrokes, and Break po
 -		JR	NZ,KCK2
 -		SET	0,(HL)			; Turn on BREAK bit
 -KCK2		POP	AF			; C=shift, NZ=break
--		RET
++		OR	A		; Clear Carry flag (CY=0)
++		BIT	0,(HL)		; Test BREAK bit: Z=0 if break, Z=1 if no break
+ 		RET
 \ No newline at end of file
-+		BIT	0,(HL)		; Break bit set?
-+		JR	NZ,kck_brk
-+		XOR	A		; Return Z=1 (no break), CY=0
-+		RET
-+kck_brk		RES	0,(HL)		; Reset bit so it triggers once
-+		LD	A,1
-+		OR	A		; Return NZ (break), CY=0 (NC)
-+		RET
