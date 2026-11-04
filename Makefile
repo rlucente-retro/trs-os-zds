@@ -86,6 +86,7 @@ fetch $(SRC_DIR)/TRSDOS.s:
 	@echo "==> Unpacking TRSDOS_7.zip..."
 	unzip -q -o TRSDOS_7.zip
 	rm -f TRSDOS_7.zip
+	@find $(SRC_DIR) $(GLOBAL_DIR) -type f \( -name "*.s" -o -name "*.S" -o -name "*.mak" \) -exec sed -i '' -e 's/\r$$//' {} +
 	@echo "==> TRS-OS source files unpacked successfully."
 
 # 1b. Apply patchset to fetched source tree
@@ -96,7 +97,7 @@ $(PATCH_STAMP): $(SRC_DIR)/TRSDOS.s $(PATCHES)
 		echo "==> Applying patchset from $(PATCH_DIR)..."; \
 		for p in $(PATCHES); do \
 			echo "    Applying $$p..."; \
-			patch -p1 -N -r - < "$$p" || exit 1; \
+			tr -d '\r' < "$$p" | patch -p1 -N -r - || exit 1; \
 		done; \
 	fi
 	@touch $@

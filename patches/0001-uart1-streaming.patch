@@ -27,27 +27,28 @@ Hardware & Architecture Constraints:
    UART1_IER (polling mode), adds a BRG warmup loop, and enables 16-byte FIFOs
    in finish_init.
 
-4. Streaming Alignment & Interrupt Protection:
-   Transparent streaming mode (CIPMODE=1) transfers 260-byte sector blocks
-   continuously. Flushing the RX/TX FIFOs (07h -> UART1_FCTL) before commands
-   clears residual AT responses, and masking interrupts (DI/EI) during reads
-   prevents 60 Hz timer tasker routines from overflowing the 16-byte RX FIFO.
+4. Z80 Mode Preservation (RSMIX):
+   Quark MOS boots in ADL mixed memory mode (MADL=1). If an interrupt occurs while
+   MADL=1, eZ80 switches to ADL mode (ADL=1) and pushes to SPL. Because TRSDOS is a
+   Z80 mode operating system, RSMIX at __init clears MADL to guarantee that interrupts
+   run and return purely in Z80 mode (ADL=0), preventing stack corruption and invalid
+   size prefix crashes during user execution.
 
-5. Stack Balance & Error Handling in FDCDVR and Ping:
-   - In driver-FDCDVR.S (RDIN): Preserves the sector buffer address across
-     checksum calculation and retry loops (pop hl; push hl). On checksum match,
-     discards buffer address and jumps to rd_finish. On checksum failure, branches
-     to retry without stack drift.
-   - In driver-FDCDVR.S error handlers: Isolates call return addresses pushed by
-     IF_NE_GOSUB on timeout (fdc_rd_timeout, fdc_wr_timeout, fdc_wr_timeout1)
-     from jump-based retry-exhaustion paths (fdc_rd_err, fdc_wr_err), ensuring
-     the stack is cleanly balanced and caller registers (BC, HL) are restored.
-   - In ipl_net_ping.s: Isolates ping_timeout (which pops the 2-byte call address
-     from IF_NE_GOSUB) from no_pong, preventing stack corruption when CMP.bytes fails.
+5. Timeout Handling in Ping & Bind:
+   - In ipl_net_ping.s: Isolates ping_timeout from no_pong to prevent stack corruption.
 
---- patch_orig/TRSDOS_7/SYS0_IPL/ipl-eZ80_CPU.S
-+++ patch_new/TRSDOS_7/SYS0_IPL/ipl-eZ80_CPU.S
-@@ -337,10 +337,10 @@
+diff -ruN a/TRSDOS_7/SYS0_IPL/ipl-eZ80_CPU.S b/TRSDOS_7/SYS0_IPL/ipl-eZ80_CPU.S
+--- a/TRSDOS_7/SYS0_IPL/ipl-eZ80_CPU.S	2026-11-04 13:52:26
++++ b/TRSDOS_7/SYS0_IPL/ipl-eZ80_CPU.S	2026-11-04 13:52:26
+@@ -6,6 +6,7 @@
+ 
+ 
+ __init	di
++		rsmix
+ 		im	2					; Prepare interrupt controller for mode 2.		
+ 
+ 		LD	A,RETOPCODE			; Ignore stray interrupt requests.
+@@ -337,10 +338,10 @@
  
  ;	Set baud rate generator. Baud rate is equated in eZ80.
  
@@ -60,7 +61,7 @@ Hardware & Architecture Constraints:
  		OUT0	(UART1_BRG_H),A   		; load high byte of BRG
  
  		LD	A,03h           		; select 8bits, no parity, 1 stop.
-@@ -428,7 +428,38 @@
+@@ -428,7 +429,38 @@
  
  ;		Initialization of CPU complete, splash first welcome/copyright screen.
  
@@ -100,8 +101,9 @@ Hardware & Architecture Constraints:
  		UART1.dtr.set				; Set DTR active tell other end we are powered on & ready.
  		ld	c,020h				; Get fill byte in accumulator.
  		ld	hl,CRTBGN$
---- patch_orig/TRSDOS_7/SYS0_IPL/ipl_net_bind.s
-+++ patch_new/TRSDOS_7/SYS0_IPL/ipl_net_bind.s
+diff -ruN a/TRSDOS_7/SYS0_IPL/ipl_net_bind.s b/TRSDOS_7/SYS0_IPL/ipl_net_bind.s
+--- a/TRSDOS_7/SYS0_IPL/ipl_net_bind.s	2026-11-04 13:52:26
++++ b/TRSDOS_7/SYS0_IPL/ipl_net_bind.s	2026-11-04 13:52:26
 @@ -16,13 +16,14 @@
  
  		PUMP	DEVICE.console,bind_screen$	; Tell operator this is bind program.
@@ -138,8 +140,9 @@ Hardware & Architecture Constraints:
  		PUMP	DEVICE.console,bind_not_rec$	; Tell operator no reply recieved.
  		GOTO	bind_exit
  
---- patch_orig/TRSDOS_7/SYS0_IPL/ipl_net_ping.s
-+++ patch_new/TRSDOS_7/SYS0_IPL/ipl_net_ping.s
+diff -ruN a/TRSDOS_7/SYS0_IPL/ipl_net_ping.s b/TRSDOS_7/SYS0_IPL/ipl_net_ping.s
+--- a/TRSDOS_7/SYS0_IPL/ipl_net_ping.s	2026-11-04 13:52:26
++++ b/TRSDOS_7/SYS0_IPL/ipl_net_ping.s	2026-11-04 13:52:26
 @@ -9,28 +9,33 @@
  		PUMP	DEVICE.console,ping_screen$	; Tell operator this is ping program.
  		PUMP	DEVICE.console,ping_da_ping$	; Report pinging server.
@@ -181,107 +184,9 @@ Hardware & Architecture Constraints:
  		MVC	server_not,server_stat,12	; Change server to show available.
  		PUMP	DEVICE.console,no_pong_rec$	; Tell operator no reply recieved.
  
---- patch_orig/TRSDOS_7/SYSRES/drivers/driver-FDCDVR.S
-+++ patch_new/TRSDOS_7/SYSRES/drivers/driver-FDCDVR.S
-@@ -164,27 +164,33 @@
- 		HEXDEC	(fdc_no_sum),net_cmd+1		; Convert 16 bit address to ascii in network command.
- 		ZEROS_RPL_SPACE	net_cmd+1		; Convert leading spaces in buffer to 0's.
- 
-+		ld	a,07h				; Flush UART1 RX/TX FIFOs before request (Olimex MOD-WIFI-ESP8266 stream)
-+		out0	(UART1_FCTL),a
-+
- 		PUMP	DEVICE.serialnet,net_cmd 	; Send <XXXXX LF.asc packet.
- 
- 		pop	hl				; Recover destination buffer address.
- 		push	hl				; Save again for checksum routine.
- 
--		UART1.get.bytes	0,hl,fdc_rd_err	 	; Get from server 256 byte sector requested.
--		UART1.get.bytes	4,chk_sum,fdc_rd_err	; Get from server 4 byte checksum.
-+		UART1.get.bytes	0,hl,fdc_rd_timeout 	; Get from server 256 byte sector requested.
-+		UART1.get.bytes	4,chk_sum,fdc_rd_timeout ; Get from server 4 byte checksum.
- 
- 		pop	hl				; Get pointer to buffer.
-+		push	hl				; Keep buffer address on stack for potential retry.
- 		GOSUB	calc_cksum
- 		ld	b,a
- 		ld	a,(chk_sum+3)
- 		cp	b
--		IF_EQ_GOTO rd_finish
-+		IF_NE_GOTO rd_retry_cksum		; Checksum mismatch -> retry
-+		pop	hl				; Discard buffer address
-+		GOTO	rd_finish			; Checksum valid -> finish
- 
- ; Here we have a error on read.
- ; Bump retry counter.
- ; Set server command to retry.
- ; If retries does not roll over to 0 go around again.
- 
--		ld	hl,rd_retries
-+rd_retry_cksum	ld	hl,rd_retries
- 		inc	(hl)				; Bump counter by 1.
- 		IF_EQ_GOTO	fdc_rd_err		; If counter rolls over to 0 we have 256 retries, abort i/o.
- 		ld	a,'\'				; Retry signal to server.
-@@ -251,12 +257,15 @@
- 		LD	a,'>'
- wr_retry	ld	(net_cmd),a			; Stuff direction in command buffer.
- 
-+		ld	a,07h				; Flush UART1 RX/TX FIFOs before request (Olimex MOD-WIFI-ESP8266 stream)
-+		out0	(UART1_FCTL),a
-+
- 		PUMP	DEVICE.serialnet,net_cmd 	; Send @<XXXXX LF.asc packet.
- 
- 		pop	hl				; Recover buffer address for read.
- 		push	hl				; Leaving one copy on stack.
- 
--		UART1.put.bytes	0,hl,fdc_wr_err 	; Write to server 256 byte sector.
-+		UART1.put.bytes	0,hl,fdc_wr_timeout 	; Write to server 256 byte sector.
- 		
- 		pop	hl				; Get buffer address.
- 		push	hl				; Leaving one copy on stack.
-@@ -264,9 +273,9 @@
- 		ld	(chk_sum+3),a			; Store these 8 bits in little endian of 32 bit python int.
- 		push	af				; Save checksum for now.
- 
--		UART1.put.bytes	4,chk_sum,fdc_wr_err1	; Send server 4 byte int containing checksum.
--
--		UART1.get.bytes	4,chk_sum,fdc_wr_err1	; Get 4 byte checksum returning from server.
-+		UART1.put.bytes	4,chk_sum,fdc_wr_timeout1 ; Send server 4 byte int containing checksum.
-+
-+		UART1.get.bytes	4,chk_sum,fdc_wr_timeout1 ; Get 4 byte checksum returning from server.
- 
- 		pop	bc				; Recover original checksum, B will have old A.
- 		ld	a,(chk_sum+3)			; Compare round trip checksum in buffer to original.
-@@ -354,16 +363,23 @@
- 		LD	(PADDRESS+1),hl
- 		ret
- 
--fdc_rd_err	pop	hl				; Discard return address.
--		pop	hl				; Discard return address.
-+fdc_rd_timeout	pop	hl				; Discard return address from IF_NE_GOSUB call.
-+fdc_rd_err	pop	hl				; Discard buffer address.
-+		pop	de				; Discard track/sector.
-+		pop	bc				; Recover entry BC.
-+		pop	hl				; Recover entry HL.
- 		ld	a,03h				; Data lost on read.
- 		or	a				; Make NZ, error.
- 		ei
- 		RETURN
- 	
--fdc_wr_err1	pop	hl				; Discard extra data.
--fdc_wr_err	pop	hl				; Buffer address.
--		pop	de				; This vector used for cleanup of 1 extra item on stack.
-+fdc_wr_timeout1	pop	hl				; Discard return address from IF_NE_GOSUB call.
-+		pop	af				; Discard saved checksum from line 271.
-+		jr	fdc_wr_err
-+
-+fdc_wr_timeout	pop	hl				; Discard return address from IF_NE_GOSUB call.
-+fdc_wr_err	pop	hl				; Discard buffer address.
-+		pop	de				; Discard track/sector.
- 		pop	bc				; Recovered from save on entry to driver.
- 		POP	HL				; Per Soltoff we restore on exit any registers we used.
- 		ld	a,14				; Write fault on disk drive.
---- patch_orig/TRSDOS_7/SYSRES/drivers/driver-UART1.S
-+++ patch_new/TRSDOS_7/SYSRES/drivers/driver-UART1.S
+diff -ruN a/TRSDOS_7/SYSRES/drivers/driver-UART1.S b/TRSDOS_7/SYSRES/drivers/driver-UART1.S
+--- a/TRSDOS_7/SYSRES/drivers/driver-UART1.S	2026-11-04 13:52:26
++++ b/TRSDOS_7/SYSRES/drivers/driver-UART1.S	2026-11-04 13:52:26
 @@ -31,13 +31,13 @@
  		ld	de,0			; Inits for 65536 countdown.
  
@@ -316,8 +221,10 @@ Hardware & Architecture Constraints:
  echo_timer	db	echo_delay_ct		; Holds counter when running timer for timeout detection.
  
  U1END:		EQU	$-1			
---- patch_orig/TRSDOS_GLOBAL/equates/equates-versions.s
-+++ patch_new/TRSDOS_GLOBAL/equates/equates-versions.s
+\ No newline at end of file
+diff -ruN a/TRSDOS_7/SYSRES/drivers/driver-UART1.S.orig b/TRSDOS_7/SYSRES/drivers/driver-UART1.S.orig
+--- a/TRSDOS_GLOBAL/equates/equates-versions.s	2026-11-04 13:52:26
++++ b/TRSDOS_GLOBAL/equates/equates-versions.s	2026-11-04 13:52:26
 @@ -11,13 +11,13 @@
  
  
