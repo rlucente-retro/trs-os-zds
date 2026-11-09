@@ -1,0 +1,427 @@
+Subject: [PATCH] Phase 2 Step 2: Implement drv_target_table router and extract driver-DWDVR.s
+
+Phase 2 Step 2 Deliverables:
+- Refactor driver-FDCDVR.S into central storage router with drv_target_table (:0..:7)
+- Extract DriveWire sector read, checksum, and write-protection logic into modular driver-DWDVR.s
+- Implement get_drv_target helper for RDIN and DOWRIT
+- Implement rd_local_sd and wr_local_sd stubs for Step 3 local SD integration
+- Prune dead legacy RAM disk and network driver variables/routines to maintain strict memory bounds
+- Export drv_target_table via equates-global-lowcore.s
+- Maintain $$$org02E94663 section ceiling under 0x001300 with 17 bytes headroom
+
+--- a/TRSDOS_GLOBAL/equates/equates-global-lowcore.s	2026-11-09 15:06:17
++++ b/TRSDOS_GLOBAL/equates/equates-global-lowcore.s	2026-11-09 15:06:13
+@@ -222,6 +222,7 @@
+ 	XDEF		dw_status
+ 	XDEF		dw_slot
+ 	XDEF		calc_dw_checksum
++	XDEF		drv_target_table
+ 
+ ; eZ80 associated xdef's.
+ 
+--- a/TRSDOS_7/SYSRES/drivers/driver-FDCDVR.S	2026-11-09 15:06:17
++++ b/TRSDOS_7/SYSRES/drivers/driver-FDCDVR.S	2026-11-09 15:06:13
+@@ -2,8 +2,6 @@
+ 		newpage
+ 		scope
+ 			
+-;		ORG		driver.FD
+-
+ PREND		EQU		$-1
+ 
+ ; FDCDVR/ASM - LS-DOS 6.2
+@@ -18,26 +16,28 @@
+ 		DW	FDCEND				;Last byte used
+ 		DB	3,"$FD"				;Module name
+ 
+-PADDRESS	db	0,0,0				; This driver calculates physical beginning of DISK start.
++PADDRESS	db	0,0,0				; Physical beginning of DISK start
++ramdrv$		blkb	16,0				; Table of drive vectors
++fdc_no_sum	dw	0				; Hold sum of physical record w/o offset
++net_volume	db	0				; Number of network volume (macro_BIND)
+ 
+-ramdrv$		blkb	16,0				; Filled in @IPL with physical pointer to boot volume.
++; Target identifiers for drv_target_table
++DRV_TARGET_SD		EQU	0			; Local SD (FatFS/eZ80 VDP)
++DRV_TARGET_DW		EQU	1			; FujiNet DriveWire 3/4
++DRV_TARGET_MEMDISK	EQU	2			; High SRAM RAM disk
+ 
+-secreq$		db	0
++; Drive Target Routing Table (8 logical drives :0 to :7)
++drv_target_table:
++		db	DRV_TARGET_DW			; Drive :0 -> DriveWire
++		db	DRV_TARGET_DW			; Drive :1 -> DriveWire
++		db	DRV_TARGET_DW			; Drive :2 -> DriveWire
++		db	DRV_TARGET_DW			; Drive :3 -> DriveWire
++		db	DRV_TARGET_DW			; Drive :4 -> DriveWire
++		db	DRV_TARGET_DW			; Drive :5 -> DriveWire
++		db	DRV_TARGET_DW			; Drive :6 -> DriveWire
++		db	DRV_TARGET_DW			; Drive :7 -> DriveWire
+ 
+-fdc_no_sum	dw	0				; Hold sum of physical record w/o offset.
+-net_volume	db	0				; Number of network volume, filled in by binding.
+-net_cmd		db	"=00000",LF.asc,ETX.asc
+-chk_sum		db	0,0,0,0
+-rd_retries	db	0
+-wr_retries	db	0
+ 
+-dw_slot		db	0
+-dw_offset	db	1,0,0,0,0,0,0,0			; Per-drive offset (1 for DiskDISK, 0 for JV1)
+-dw_hdr		db	0D2h,0,0,0,0			; 5-byte OP_READEX request header
+-dw_chk		db	0,0				; 2-byte big-endian checksum
+-dw_status	db	0				; 1-byte status return
+-
+-
+ ;       Disk Driver Entry Point
+ ; ____________________________________
+ 
+@@ -46,9 +46,6 @@
+ 
+ 		ld	a,c				; Get drive requested code.
+ 		ld	(LDRV$),a			; Store in current logical drive.
+-
+-		ld	a,e				; Get sector requested.  <<<-------
+-		ld	(secreq$),a			; Store for later.
+ 	
+ 		ld	a,(IY+4)			; Get drive select code entry.
+ 		and	0Fh 				; Strip out drive entry code.
+@@ -58,15 +55,7 @@
+ 		push	hl				; Per Soltoff we save any registers we use.			
+ 		push	bc				; Per Soltoff we save any registers we use.
+ 		push	hl				; Per Soltoff we save any registers we use.
+-			
+-		ld	b,0	
+-		sla	c				; drive * 2.
+ 
+-		ld	hl,ramdrv$			; Get address of drive vectors. 
+-		add	hl,bc				; drive vector = vector + drive
+-		ld	hl,(hl)				; Get vector.
+-		ld	(RAMDRV$),hl			; Store here so driver can use on this call.
+-
+ 		LD	HL,funtable$			; Base address of function table.
+ 		sla	a				; Function=function*2.
+ 		ld	b,0
+@@ -141,6 +130,18 @@
+ 		ld	A,00000010b			; Bit one set meaning index pulse.
+ 		ei
+ 		RET					; We are solid state drive, were always ready.
++
++; Helper: Look up target ID for logical drive (LDRV$) in drv_target_table
++; Returns: A = Target ID (0=SD, 1=DriveWire, 2=MEMDISK)
++get_drv_target:
++		ld	hl,drv_target_table
++		ld	a,(LDRV$)
++		and	07h
++		ld	e,a
++		ld	d,0
++		add	hl,de
++		ld	a,(hl)
++		ret
+ 								
+ ;	I/O request handler read routine.
+ 
+@@ -149,63 +150,16 @@
+ 
+ 		call	calcsec				; Calculate address of sector to read.
+ 
+-; Phase 1 DriveWire read: route drives to DriveWire OP_READEX (0xD2)
+-rd_drivewire	ld	a,(LDRV$)			; Get requested logical drive
+-		ld	(dw_slot),a			; Direct 1:1 slot mapping
+-
+-		; Add container offset (0 for raw JV1, 1 for DiskDISK header)
+-		ld	e,a
+-		ld	d,0
+-		ld	hl,dw_offset
+-		add	hl,de
+-		ld	e,(hl)				; E = offset (0 or 1)
+-		ld	hl,(fdc_no_sum)			; HL = calculated LSN
+-		add	hl,de				; HL = wire LSN on server
+-
+-		; Prepare 5-byte OP_READEX request header
+-		ld	a,0D2h				; OP_READEX opcode
+-		ld	(dw_hdr+0),a
+-		ld	a,(dw_slot)			; Virtual device slot
+-		ld	(dw_hdr+1),a
+-		xor	a
+-		ld	(dw_hdr+2),a			; LSN [23..16] = 0
+-		ld	a,h
+-		ld	(dw_hdr+3),a			; LSN [15..8]
+-		ld	a,l
+-		ld	(dw_hdr+4),a			; LSN [7..0]
+-
+-		; Flush UART1 RX/TX FIFOs before request
+-		ld	a,07h
+-		out0	(UART1_FCTL),a
+-
+-		; Transmit 5-byte request header over UART1
+-		UART1.put.bytes 5,dw_hdr,fdc_rd_timeout
+-
+-		; Receive 256-byte sector data directly into target buffer
+-		pop	hl				; Recover user destination buffer pointer
+-		push	hl				; Save for checksum
+-		UART1.get.bytes 0,hl,fdc_rd_timeout	; Length 0 = 256 bytes
+-
+-		; Calculate 16-bit big-endian unsigned checksum
+-		pop	hl				; Recover buffer pointer
+-		push	hl				; Keep on stack for rd_finish
+-		call	calc_dw_checksum		; Computes sum: D=MSB, E=LSB
+-		ld	a,d
+-		ld	(dw_chk+0),a
+-		ld	a,e
+-		ld	(dw_chk+1),a
+-
+-		; Transmit 2-byte checksum to server
+-		UART1.put.bytes 2,dw_chk,fdc_rd_timeout
+-
+-		; Receive 1-byte status from server (0x00 = success)
+-		UART1.get.bytes 1,dw_status,fdc_rd_timeout
+-		ld	a,(dw_status)
++		; Route sector read via drv_target_table
++		call	get_drv_target
+ 		or	a
+-		jr	nz,fdc_rd_err
++		jr	z,rd_local_sd			; Target 0: Local SD
++		dec	a
++		jp	z,rd_drivewire			; Target 1: DriveWire
++		jp	fdc_rd_err			; Unsupported target
+ 
+-		pop	hl				; Clean up buffer pointer from stack
+-		jp	rd_finish			; Clean exit via authentic LS-DOS handler
++rd_local_sd:
++		jp	fdc_rd_err			; Stub: Local SD read (Step 3)
+ 
+ rd_finish	POP	de				; Restore DE to track/sector.
+ 		ld	a,d				; Get track we just read.
+@@ -219,22 +173,33 @@
+ 		RETURN					; Return with NZ flag set indicating error.
+ 
+ 
+-DOWRIT	; Stage 1 write protection: reject writes with R_PROTECTED (Error 15)
++DOWRIT		; Route sector write via drv_target_table
++		call	get_drv_target
++		or	a
++		jr	z,wr_local_sd			; Target 0: Local SD
++		dec	a
++		jp	z,wr_drivewire			; Target 1: DriveWire
++		; Invalid target fallback
++		pop	bc
++		pop	hl
++		ld	a,14				; Write fault
++		or	a
++		ei
++		ret
++
++wr_local_sd:
+ 		pop	bc				; Recovered from save on entry to driver.
+-		POP	HL				; Per Soltoff we restore on exit any registers we used.
+-		LD	A,15				; Error 15 = R_PROTECTED (Write Protected)
++		pop	hl				; Per Soltoff restore on exit registers used.
++		ld	a,15				; Error 15 = R_PROTECTED (Write Protected)
+ 		or	a				; Set NZ for error
+ 		ei
+-		RET
++		ret
+ 
+-; IY points do DCTx$
++; IY points to DCTx$
+ ; D - contains track.
+ ; E - contains sector.
+ 
+ ; Calculate physical address based on track & sector.
+-; Convert TRACK / SECTOR to physical RAM drive address.
+-
+-
+ ; 1st determine if sector on side 0 or side 1.
+ 
+ calcsec		LD	A,(IY+7)			; p/u alloc data
+@@ -258,28 +223,14 @@
+ 		jr	z,stp23				; NO, skip doubling sectors per track.
+ 		sla	a				; A = A * 2, double sided - double sectors per trk.
+ 
+-; 3rd perfom following math leaving results in HL.
++; 3rd perform following math leaving results in HL.
+ ; sector requested + (requested cylinder number * sectors per track).
+ 
+ stp23		LD	E,A				; Move # of SEC per CYL to E.
+-		MLT	DE				; we then multiply (# CYL * SEC per CYL) 16b result in DE.
++		MLT	DE				; multiply (# CYL * SEC per CYL) 16b result in DE.
+ 		add	hl,de				; Add in sector number we saved before.
+ 
+-		ld	(fdc_no_sum),hl	; Save sum w/o offset for net driver.
+-
+-; 4th, using upper 16 bits of RAM drive base address, add in offset using results of above calculation.
+-; Leave results in HL.
+-; RAMDRV$ below was populated at entry to driver by looking up using drive #.
+-
+-		ld	de,$
+-RAMDRV$		equ	$-2				; Upper 16 bits of base RAM drive address.
+-		add	hl,de				; Sum them together with offset to data.
+-
+-; Lastly, we stuff physical address of sector in PADDRESS.
+-
+-		XOR	A				; A = 0 for below code.
+-		LD	(PADDRESS),a
+-		LD	(PADDRESS+1),hl
++		ld	(fdc_no_sum),hl			; Save calculated 16-bit LSN.
+ 		ret
+ 
+ fdc_rd_timeout	pop	hl				; Discard return address from IF_NE_GOSUB call.
+@@ -291,38 +242,8 @@
+ 		or	a				; Make NZ, error.
+ 		ei
+ 		RETURN
+-	
+-fdc_wr_timeout1	pop	hl				; Discard return address from IF_NE_GOSUB call.
+-		pop	af				; Discard saved checksum from line 271.
+-		jr	fdc_wr_err
+ 
+-fdc_wr_timeout	pop	hl				; Discard return address from IF_NE_GOSUB call.
+-fdc_wr_err	pop	hl				; Discard buffer address.
+-		pop	de				; Discard track/sector.
+-		pop	bc				; Recovered from save on entry to driver.
+-		POP	HL				; Per Soltoff we restore on exit any registers we used.
+-		ld	a,14				; Write fault on disk drive.
+-		or	a				; Make NZ, error
+-		ei
+-		RETURN
++; Include DriveWire driver module
++		INCLUDE "driver-DWDVR.s"
+ 
+-calc_cksum	ld	b,0
+-		xor	a
+-		add	(hl)				; A= A + (HL)
+-		inc	hl
+-		LOOP	calc_cksum+3
+-		RETURN
+-
+-calc_dw_checksum:
+-		ld	de,0				; DE = 16-bit big-endian sum
+-		ld	b,0				; 256 iterations
+-dw_chk_loop:	ld	a,(hl)
+-		inc	hl
+-		add	a,e
+-		ld	e,a
+-		jr	nc,dw_chk_nocarry
+-		inc	d
+-dw_chk_nocarry:	djnz	dw_chk_loop
+-		ret
+-
+-FDCEND:		EQU	$-1
+\ No newline at end of file
++FDCEND:		EQU	$-1
+--- /dev/null
++++ b/TRSDOS_7/SYSRES/drivers/driver-DWDVR.s
+@@ -0,0 +1,113 @@
++		SUBTITLE	"<DriveWire Storage Driver>"
++		newpage
++
++; ==============================================================================
++; driver-DWDVR.s - FujiNet / DriveWire 3/4 Sector Driver for TRS-OS (TRSDOS 7)
++;
++; Provides sector read via DriveWire OP_READEX (0xD2) and write-protection
++; enforcement for remote virtual disk images over eZ80 UART1.
++; ==============================================================================
++
++; DriveWire Protocol State Variables
++dw_slot		db	0				; Virtual device slot (0..7)
++dw_offset	db	1,0,0,0,0,0,0,0			; Container offset: 1 for DiskDISK (+256B header), 0 for JV1
++dw_hdr		db	0D2h,0,0,0,0			; 5-byte OP_READEX request header: [opcode, slot, LSN23..16, LSN15..8, LSN7..0]
++dw_chk		db	0,0				; 2-byte big-endian checksum [MSB, LSB]
++dw_status	db	0				; 1-byte status return (0x00 = success)
++
++; ------------------------------------------------------------------------------
++; rd_drivewire - Read 256-byte sector over DriveWire via UART1
++;
++; Entry:
++;   Stack: [saved HL (destination buffer)], [saved DE (track/sector)], [saved BC], [saved HL]
++;   (fdc_no_sum): 16-bit logical sector number calculated by calcsec
++;   (LDRV$): requested logical drive (0..7)
++; Exit:
++;   Success: jumps to rd_finish (pops DE, checks system cylinder, restores regs, returns)
++;   Failure: jumps to fdc_rd_err (pops buffer, DE, BC, HL, returns A=03h NZ)
++; ------------------------------------------------------------------------------
++rd_drivewire:
++		ld	a,(LDRV$)			; Logical drive number (0..7)
++		ld	(dw_slot),a			; Direct 1:1 slot mapping
++		ld	(dw_hdr+1),a			; Virtual device slot in packet header
++
++		; Add container offset (0 for raw JV1, 1 for DiskDISK header)
++		ld	e,a
++		ld	d,0
++		ld	hl,dw_offset
++		add	hl,de
++		ld	e,(hl)				; E = offset (0 or 1)
++		ld	hl,(fdc_no_sum)			; HL = calculated LSN
++		add	hl,de				; HL = wire LSN on server
++
++		; Prepare 5-byte OP_READEX request header (opcode 0xD2 and MSB 0x00 are static)
++		ld	a,h
++		ld	(dw_hdr+3),a			; LSN [15..8]
++		ld	a,l
++		ld	(dw_hdr+4),a			; LSN [7..0]
++
++		; Flush UART1 RX/TX FIFOs before request
++		ld	a,07h
++		out0	(UART1_FCTL),a
++
++		; Transmit 5-byte request header over UART1
++		UART1.put.bytes 5,dw_hdr,fdc_rd_timeout
++
++		; Receive 256-byte sector data directly into target buffer
++		pop	hl				; Recover user destination buffer pointer
++		push	hl				; Save for checksum
++		UART1.get.bytes 0,hl,fdc_rd_timeout	; Length 0 = 256 bytes
++
++		; Calculate 16-bit big-endian unsigned checksum
++		pop	hl				; Recover buffer pointer
++		push	hl				; Keep on stack for rd_finish
++		call	calc_dw_checksum		; Computes sum: D=MSB, E=LSB
++		ld	a,d
++		ld	(dw_chk+0),a
++		ld	a,e
++		ld	(dw_chk+1),a
++
++		; Transmit 2-byte checksum to server
++		UART1.put.bytes 2,dw_chk,fdc_rd_timeout
++
++		; Receive 1-byte status from server (0x00 = success)
++		UART1.get.bytes 1,dw_status,fdc_rd_timeout
++		ld	a,(dw_status)
++		or	a
++		jp	nz,fdc_rd_err
++
++		pop	hl				; Clean up buffer pointer from stack
++		jp	rd_finish			; Clean exit via authentic LS-DOS handler
++
++; ------------------------------------------------------------------------------
++; wr_drivewire - Write 256-byte sector over DriveWire (Stage 1/2: Read-Only)
++;
++; Entry:
++;   Stack: [saved BC], [saved HL]
++; Exit:
++;   Returns A=15 (R_PROTECTED / Write Protected) with NZ set
++; ------------------------------------------------------------------------------
++wr_drivewire:
++		pop	bc				; Recovered from save on entry to driver
++		pop	hl				; Per Soltoff restore on exit registers used
++		ld	a,15				; Error 15 = R_PROTECTED (Write Protected)
++		or	a				; Set NZ for error
++		ei
++		ret
++
++; ------------------------------------------------------------------------------
++; calc_dw_checksum - 16-bit big-endian checksum over 256 bytes at (HL)
++;
++; Returns: D = MSB, E = LSB, HL advanced by 256
++; ------------------------------------------------------------------------------
++calc_dw_checksum:
++		ld	de,0				; DE = 16-bit sum
++		ld	b,0				; 256 iterations
++dw_chk_loop:	ld	a,(hl)
++		inc	hl
++		add	a,e
++		ld	e,a
++		jr	nc,dw_chk_nocarry
++		inc	d
++dw_chk_nocarry:	djnz	dw_chk_loop
++		ret
