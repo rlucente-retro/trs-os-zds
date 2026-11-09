@@ -1,0 +1,353 @@
+Subject: [PATCH] Phase 2 Step 3: Implement driver-SDDVR.s local microSD SPI0 block driver
+
+Phase 2 Step 3 Deliverables:
+- Implement driver-SDDVR.s for Olimex Agon Light 2 eZ80 SPI0 hardware block I/O
+- Implement 512-byte to 256-byte sector translation (1 SD block = 2 TRSDOS sectors)
+- Stream requested 256-byte sub-sector directly into user buffer with zero intermediate buffering
+- Provide 8-entry sddvr_base_lba table for independent per-drive microSD .dsk image LBAs
+- Intercept local SD write requests with R_PROTECTED (Error 15) write protection
+- Position driver-SDDVR.s in high memory at 0xF400, lowering COREEND$ to 0xF3FF
+- Connect rd_local_sd and wr_local_sd entry points in driver-FDCDVR.S
+- Low driver segment (86986) expands headroom to 21 bytes below 0x001300
+
+--- a/TRSDOS_GLOBAL/equates/equates-versions.s	2026-11-09 15:20:00
++++ b/TRSDOS_GLOBAL/equates/equates-versions.s	2026-11-09 15:20:00
+@@ -36,7 +36,7 @@
+ 
+ COREMAX$		EQU   	START$+2400h		; Start of application area when no library zone used.
+ COREMIN$		EQU   	START$+3000h		; Start of application area with active library area.
+-COREEND$		EQU	INTERRUPT.handler-0ch	; End+1 of usable memory for high memory routines.
++COREEND$		EQU	0F3FFh			; End of usable memory below high driver area (0F400h).
+ 
+ ENDRAM$			EQU	10000H-1
+ 
+
+--- a/TRSDOS_GLOBAL/equates/equates-global-lowcore.s	2026-11-09 15:20:00
++++ b/TRSDOS_GLOBAL/equates/equates-global-lowcore.s	2026-11-09 15:20:00
+@@ -223,6 +223,10 @@
+ 	XDEF		dw_slot
+ 	XDEF		calc_dw_checksum
+ 	XDEF		drv_target_table
++	XDEF		sddvr_read_sector
++	XDEF		sddvr_write_sector
++	XDEF		sddvr_base_lba
++	XDEF		sddvr_init
+ 
+ ; eZ80 associated xdef's.
+ 
+
+--- a/TRSDOS_7/TRSDOS.s	2026-11-09 15:20:00
++++ b/TRSDOS_7/TRSDOS.s	2026-11-09 15:20:00
+@@ -155,6 +155,9 @@
+ 		GOTO	zICNFG					; Here we start initilization chain.		
+ 		SUBTITLE	"< SYSRES HIGH memory region. >"
+ 		
++		ORG	0F400h
++		INCLUDE "driver-SDDVR.s"			; Local MicroSD SPI0 driver
++
+ ; HIGH$ memory contains video RAM, interrupt handler, reboot code etc.
+ 
+ 		ORG     INTERRUPT.handler-0bh
+
+--- a/TRSDOS_7/SYSRES/drivers/driver-FDCDVR.S	2026-11-09 15:20:00
++++ b/TRSDOS_7/SYSRES/drivers/driver-FDCDVR.S	2026-11-09 15:20:00
+@@ -159,7 +159,7 @@
+ 		jp	fdc_rd_err			; Unsupported target
+ 
+ rd_local_sd:
+-		jp	fdc_rd_err			; Stub: Local SD read (Step 3)
++		jp	sddvr_read_sector		; Call local SD block driver
+ 
+ rd_finish	POP	de				; Restore DE to track/sector.
+ 		ld	a,d				; Get track we just read.
+@@ -188,12 +188,7 @@
+ 		ret
+ 
+ wr_local_sd:
+-		pop	bc				; Recovered from save on entry to driver.
+-		pop	hl				; Per Soltoff restore on exit registers used.
+-		ld	a,15				; Error 15 = R_PROTECTED (Write Protected)
+-		or	a				; Set NZ for error
+-		ei
+-		ret
++		jp	sddvr_write_sector		; Call local SD write driver
+ 
+ ; IY points to DCTx$
+ ; D - contains track.
+
+--- /dev/null
++++ b/TRSDOS_7/SYSRES/drivers/driver-SDDVR.s
+@@ -0,0 +1,273 @@
++		SUBTITLE	"<Local MicroSD SPI0 Storage Driver>"
++		newpage
++
++; ==============================================================================
++; driver-SDDVR.s - Local MicroSD Card SPI0 Block Driver for TRS-OS (TRSDOS 7)
++; Target Platform: Olimex Agon Light 2 (Zilog eZ80F92 @ 18.432 MHz)
++;
++; Provides raw physical sector read and write protection for .dsk disk images
++; residing on the Agon Light 2 on-board microSD card via hardware SPI0.
++;
++; Block Translation:
++;   SD card physical blocks = 512 bytes
++;   TRSDOS logical sectors   = 256 bytes (1 SD block = 2 TRSDOS sectors)
++;   SD Block LBA = BaseLBA + (LSN / 2)
++;   Sub-sector   = LSN & 1 (0 = lower 256 bytes, 1 = upper 256 bytes)
++; ==============================================================================
++
++; SD SPI Command Definitions
++CMD17_READ_BLOCK	EQU	40h + 17	; 0x51: READ_SINGLE_BLOCK
++CMD24_WRITE_BLOCK	EQU	40h + 24	; 0x58: WRITE_SINGLE_BLOCK
++DATA_START_TOKEN	EQU	0FEh		; Data token for Single Block Read
++
++; ------------------------------------------------------------------------------
++; Driver State & Working Storage
++; ------------------------------------------------------------------------------
++sddvr_inited:	db	0				; 0 = uninitialized, 1 = initialized
++sd_subsector:	db	0				; Sub-sector selector (0 or 1)
++sd_cmd_buf:	db	0, 0, 0, 0, 0, 0FFh		; 6-byte CMD17 packet buffer
++
++; 8-entry table of 32-bit physical starting LBAs (1 per logical drive :0..:7)
++; Populated at mount time by pre-boot launcher (FNBOOT) or in-DOS SDMOUNT.
++; Little-endian: [LSB, byte1, byte2, MSB]
++sddvr_base_lba:
++		dd	0, 0, 0, 0, 0, 0, 0, 0		; 32 bytes (8 drives x 4 bytes)
++
++; ------------------------------------------------------------------------------
++; sddvr_init - Initialize eZ80 SPI0 and Port B GPIOs for Agon MicroSD Card
++;
++; Port B Pin Assignments on Agon Light 2:
++;   PB1 = MOSI (SPI0 Out)  -> Mode 7 (Alternate Function: DDR=1, ALT1=0, ALT2=1)
++;   PB2 = MISO (SPI0 In)   -> Mode 7 (Alternate Function: DDR=1, ALT1=0, ALT2=1)
++;   PB3 = SCK  (SPI0 Clock)-> Mode 7 (Alternate Function: DDR=1, ALT1=0, ALT2=1)
++;   PB4 = /CS  (Chip Sel)  -> Mode 2 (GPIO Output:       DDR=0, ALT1=0, ALT2=0)
++; ------------------------------------------------------------------------------
++sddvr_init:
++		push	af
++		push	bc
++
++		; Configure PB1, PB2, PB3 in Mode 7 (Alternate Function, mask 0Eh)
++		in0	a,(PB_DDR)
++		or	0Eh
++		out0	(PB_DDR),a
++		in0	a,(PB_ALT1)
++		and	0F1h
++		out0	(PB_ALT1),a
++		in0	a,(PB_ALT2)
++		or	0Eh
++		out0	(PB_ALT2),a
++
++		; Configure PB4 (/CS) in Mode 2 (GPIO Output, mask 10h)
++		in0	a,(PB_DDR)
++		and	0EFh
++		out0	(PB_DDR),a
++		in0	a,(PB_ALT1)
++		and	0EFh
++		out0	(PB_ALT1),a
++		in0	a,(PB_ALT2)
++		and	0EFh
++		out0	(PB_ALT2),a
++
++		; Deassert /CS high (inactive)
++		in0	a,(PB_DR)
++		or	10h
++		out0	(PB_DR),a
++
++		; Reset and configure SPI0 controller
++		xor	a
++		out0	(SPI_CTL),a			; Disable SPI0 during setup
++
++		; Set SPI0 BRG Divisor:
++		; 18.432 MHz / (2 * 2) = 4.608 MHz high-speed SPI transfer clock
++		ld	bc,2
++		out0	(SPI_BRG_H),b
++		out0	(SPI_BRG_L),c
++
++		; Enable SPI0 as Master: CPOL=0, CPHA=0, SPI_EN=1, MASTER_EN=1 (30h)
++		ld	a,30h
++		out0	(SPI_CTL),a
++
++		ld	a,1
++		ld	(sddvr_inited),a
++
++		pop	bc
++		pop	af
++		ret
++
++; ------------------------------------------------------------------------------
++; Low-Level SPI Helper Routines
++; ------------------------------------------------------------------------------
++spi_kick:	ld	a,0FFh
++spi_tx_rx:	out0	(SPI_TSR),a			; Transmit byte across SPI0
++spi_wait:	in0	a,(SPI_SR)			; Poll SPI status register
++		jp	p,spi_wait			; Wait while bit 7 (SPIF) is 0
++		in0	a,(SPI_RBR)			; Read received byte
++		ret
++
++sd_select:	in0	a,(PB_DR)			; Assert /CS (PB4 low)
++		and	0EFh
++		out0	(PB_DR),a
++		ret
++
++sd_deselect:	in0	a,(PB_DR)			; Deassert /CS (PB4 high)
++		or	10h
++		out0	(PB_DR),a
++		call	spi_kick			; Provide 8 trailing clocks
++		ret
++
++; ------------------------------------------------------------------------------
++; sddvr_read_sector - Read 256-byte sector from local microSD via SPI0
++;
++; Entry:
++;   Stack: [saved HL (destination buffer)], [saved DE (track/sector)], [saved BC], [saved HL]
++;   (fdc_no_sum): 16-bit logical sector number calculated by calcsec
++;   (LDRV$): requested logical drive (0..7)
++; Exit:
++;   Success: jumps to rd_finish (pops DE, checks system cylinder, restores regs, returns)
++;   Failure: jumps to fdc_rd_err (pops buffer, DE, BC, HL, returns A=03h NZ)
++; ------------------------------------------------------------------------------
++sddvr_read_sector:
++		; Ensure hardware SPI0 is initialized
++		ld	a,(sddvr_inited)
++		or	a
++		call	z,sddvr_init
++
++		; 1. Check if requested drive has a valid non-zero BaseLBA
++		ld	a,(LDRV$)
++		and	07h
++		sla	a
++		sla	a				; A = drive * 4
++		ld	e,a
++		ld	d,0
++		ld	ix,sddvr_base_lba
++		add	ix,de				; IX -> sddvr_base_lba[drive]
++
++		ld	a,(ix+0)
++		or	(ix+1)
++		or	(ix+2)
++		or	(ix+3)
++		jp	z,fdc_rd_err			; Drive not mounted -> Error 3 (Data lost)
++
++		; 2. Calculate SD Block LBA = BaseLBA + (LSN / 2)
++		; Sub-sector = LSN & 1
++		ld	de,(fdc_no_sum)			; DE = 16-bit LSN
++		ld	a,e
++		and	01h
++		ld	(sd_subsector),a		; 0 = lower 256B, 1 = upper 256B
++
++		srl	d
++		rr	e				; DE = LSN / 2
++
++		; 32-bit addition: BaseLBA + DE
++		; Little-endian: (ix+0)=LSB, (ix+1), (ix+2), (ix+3)=MSB
++		ld	a,(ix+0)
++		add	a,e
++		ld	(sd_cmd_buf+4),a		; CMD17 packet LSB
++		ld	a,(ix+1)
++		adc	a,d
++		ld	(sd_cmd_buf+3),a
++		ld	a,(ix+2)
++		adc	a,0
++		ld	(sd_cmd_buf+2),a
++		ld	a,(ix+3)
++		adc	a,0
++		ld	(sd_cmd_buf+1),a		; CMD17 packet MSB
++
++		ld	a,CMD17_READ_BLOCK		; 0x51
++		ld	(sd_cmd_buf+0),a
++		ld	a,0FFh
++		ld	(sd_cmd_buf+5),a		; Dummy CRC
++
++		; 3. Assert /CS and transmit 6-byte CMD17 packet
++		call	sd_select
++		call	spi_kick			; Synchronization clock
++
++		ld	hl,sd_cmd_buf
++		ld	b,6
++sd_cmd_loop:	ld	a,(hl)
++		inc	hl
++		call	spi_tx_rx
++		djnz	sd_cmd_loop
++
++		; 4. Wait for R1 response (bit 7 = 0)
++		ld	b,255
++sd_wait_r1:	call	spi_kick
++		bit	7,a
++		jr	z,sd_r1_ok
++		djnz	sd_wait_r1
++		call	sd_deselect			; R1 timeout
++		jp	fdc_rd_err
++
++sd_r1_ok:	or	a
++		jr	z,sd_wait_data			; 0x00 = success
++		call	sd_deselect			; Non-zero = command error
++		jp	fdc_rd_err
++
++		; 5. Wait for Data Start Token (0xFE)
++sd_wait_data:	ld	bc,5000
++sd_wait_tok:	call	spi_kick
++		cp	DATA_START_TOKEN		; 0xFE
++		jr	z,sd_read_payload
++		dec	bc
++		ld	a,b
++		or	c
++		jr	nz,sd_wait_tok
++		call	sd_deselect			; Token timeout
++		jp	fdc_rd_err
++
++		; 6. Read 512-byte payload with 256-byte sub-sector filtering
++sd_read_payload:
++		pop	hl				; Recover destination user buffer pointer
++		ld	a,(sd_subsector)
++		or	a
++		jr	nz,sd_read_upper
++
++		; Sub-sector 0: Read first 256 bytes into buffer, discard second 256 bytes
++		ld	b,0				; 256 bytes
++sd_r0_buf:	call	spi_kick
++		ld	(hl),a
++		inc	hl
++		djnz	sd_r0_buf
++
++		ld	b,0				; 256 bytes discard
++sd_r0_disc:	call	spi_kick
++		djnz	sd_r0_disc
++		jr	sd_read_crc
++
++		; Sub-sector 1: Discard first 256 bytes, read second 256 bytes into buffer
++sd_read_upper:
++		ld	b,0				; 256 bytes discard
++sd_r1_disc:	call	spi_kick
++		djnz	sd_r1_disc
++
++		ld	b,0				; 256 bytes
++sd_r1_buf:	call	spi_kick
++		ld	(hl),a
++		inc	hl
++		djnz	sd_r1_buf
++
++		; 7. Read and discard 2-byte CRC
++sd_read_crc:	call	spi_kick
++		call	spi_kick
++
++		; 8. Deassert /CS
++		call	sd_deselect
++
++		; 9. Clean exit via authentic LS-DOS handler
++		jp	rd_finish
++
++; ------------------------------------------------------------------------------
++; sddvr_write_sector - Write 256-byte sector to local microSD (Stage 1/2: Read-Only)
++;
++; Entry:
++;   Stack: [saved BC], [saved HL]
++; Exit:
++;   Returns A=15 (R_PROTECTED / Write Protected) with NZ set
++; ------------------------------------------------------------------------------
++sddvr_write_sector:
++		pop	bc				; Recovered from save on entry to driver
++		pop	hl				; Per Soltoff restore on exit registers used
++		ld	a,15				; Error 15 = R_PROTECTED (Write Protected)
++		or	a				; Set NZ for error
++		ei
++		ret
