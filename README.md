@@ -1,32 +1,40 @@
-# TRS-OS macOS Build Automation
+# TRS-OS macOS Build Automation (`fujinet-dw-boot` Branch)
 
 This repository provides build automation to compile Daniel Paul Martin's **TRS-OS** (TRSDOS 6.3.1 / LS-DOS 6.3 for the Zilog eZ80) directly from the macOS terminal (Apple Silicon and Intel) without requiring an interactive Windows installation.
 
-It includes an automated patchset specifically tailored for the **Olimex Agon Light 2** when paired with the **Olimex MOD-WIFI-ESP8266** module via its 10-pin **UEXT** expansion connector, enabling transparent TCP/IP network disk streaming with [`trs-netd`](https://github.com/rlucente-retro/trs-net-tcp).
+This branch (`fujinet-dw-boot`) incorporates the **FujiNet DriveWire 3/4 & Multi-Tier Storage Architecture** for the **Olimex Agon Light 2**, replacing the legacy embedded in-memory RAM disk with:
+1. **Pure Network Booting:** Direct IPL of Drive `:0` from FujiNet Device Slot 0 over UART1 via DriveWire `OP_READEX` (`0xD2`).
+2. **Lean Kernel Footprint (~64 KB):** Shrinks `TRSDOS.bin` from ~480 KB down to **66,048 bytes**, freeing **448 KB of external SRAM** for user applications and expanded memory.
+3. **Multi-Tier Storage Router:** Unified dispatching in `driver-FDCDVR.S` across DriveWire network storage (`driver-DWDVR.s`), local Agon microSD card SPI0 storage (`driver-SDDVR.s`), and high SRAM RAM disks.
+4. **Console & Display Hardening:** Complete elimination of VDP cursor artifacts, display freeze fixes, and authentic Model 4 Break & Ctrl-C handling in BASIC.
 
-The built operating system binary (`TRSDOS.bin`) is launched on the Agon Light using Shawn Sijnstra's [**OSboot** loader](https://github.com/sijnstra/agon-projects/tree/main/OSboot).
-
----
-
-## What This Repository Does
-
-* **Automated Downloads**: Fetches the official upstream TRS-OS source tree (`TRSDOS_7.zip`) and Zilog ZDS II development tools directly from upstream distribution points.
-* **Automated Patchset Pipeline**: Applies architecture-specific patches (`patches/`) after fetch to adapt upstream TRS-OS for the Olimex Agon Light 2 hardware environment.
-* **Headless macOS Build Pipeline**: Assembles and links `TRSDOS.hex` using Zilog's command-line tools (`ez80asm.exe` and `eZ80link.exe`) through Apple's 32-on-64 WoW64 Wine translation layer (`wine64`).
-* **Binary Generation for OSboot**: Converts the assembled Intel HEX binary directly into a flat binary (`TRSDOS.bin`) ready to be deployed with `OSboot`.
-* **Source Integrity**: Upstream source archives and unpacked trees are kept separate and gitignored; only the patchset and build automation are version-controlled.
+The built operating system binary (`TRSDOS.bin`) is launched on the Agon Light using Shawn Sijnstra's [**OSboot** loader](https://github.com/sijnstra/agon-projects/tree/main/OSboot) or the `FNBOOT` pre-boot visual manager.
 
 ---
 
-## Target Hardware: Olimex Agon Light 2 with MOD-WIFI-ESP8266 on UEXT
-
-The included patchset ([`patches/0001-uart1-streaming.patch`](patches/0001-uart1-streaming.patch)) is designed specifically for:
+## Target Hardware & Expansion Setup
 
 * **Host Computer**: **Olimex Agon Light 2** (Zilog eZ80F92 microcontroller running at 18.432 MHz).
 * **Expansion Header**: **10-pin UEXT connector** (standard Olimex peripheral interface).
-* **Wireless Module**: **Olimex MOD-WIFI-ESP8266** (plugged directly into UEXT, running factory Espressif ESP-AT firmware).
+* **Peripherals Supported**:
+  - **Option A (Wi-Fi):** **Olimex MOD-WIFI-ESP8266** (UEXT) running factory ESP-AT firmware in transparent streaming mode (`CIPMODE=1`).
+  - **Option B (Direct Serial):** **Olimex MOD-USB-RS232** (UEXT) connected directly to a FujiNet hardware device or FujiNet-PC.
+  - **Local Storage:** On-board MicroSD card socket connected via eZ80 hardware SPI0 (Port B).
 * **Bootstrap Loader**: **`OSboot.bin`** ([sijnstra/agon-projects/OSboot](https://github.com/sijnstra/agon-projects/tree/main/OSboot)) executed from Quark MOS.
-* **Networking Daemon**: Connected over Wi-Fi to a host running **`trs-netd`** (TRS-NET TCP/IP daemon) in transparent streaming mode (`CIPMODE=1`).
+
+---
+
+## Automated Patchset Pipeline (`patches/`)
+
+The build pipeline applies five sequential, modular patches to adapt upstream TRS-OS into a lean, multi-tier network operating system:
+
+| Patch File | Commit | Core Architectural Purpose |
+| :--- | :--- | :--- |
+| [`patches/0001-uart1-streaming.patch`](patches/0001-uart1-streaming.patch) | Baseline | Configures Port C Mode 7 (`PC0`=TXD1, `PC1`=RXD1), loads 115,200 baud divisor (10), enables 16B hardware FIFOs, and zeroes `UART1_IER` during `finish_init`. |
+| [`patches/0002-fujinet-drivewire-boot.patch`](patches/0002-fujinet-drivewire-boot.patch) | [`60659af`](https://github.com/rlucente-retro/trs-os-zds/commit/60659af) | Eliminates 425 KB embedded RAM disk, implements pure DriveWire `OP_READEX` (`0xD2`) network IPL for Drive `:0`, adds container format transparency (JV1 vs DiskDISK), and enforces Stage 1 read-only write protection (`R_PROTECTED` / Error 15). |
+| [`patches/0003-fix-vdp-display-and-keyboard-glitches.patch`](patches/0003-fix-vdp-display-and-keyboard-glitches.patch) | [`59415a0`](https://github.com/rlucente-retro/trs-os-zds/commit/59415a0), [`ee88f2e`](https://github.com/rlucente-retro/trs-os-zds/commit/ee88f2e) | Suppresses VDP block cursor, fixes display loop freezes by removing `DI` in `driver-DODVR.S`, implements 256-iteration safety loop in `u0_gb`, and restores authentic Model 4 Break and Ctrl-C handling in BASIC via `scan-kflag.s` and `SVC106-ckbrkc.s`. |
+| [`patches/0004-storage-router.patch`](patches/0004-storage-router.patch) | [`9f4ea34`](https://github.com/rlucente-retro/trs-os-zds/commit/9f4ea34) | Implements 8-drive routing table (`drv_target_table`) in `driver-FDCDVR.S` routing to Local SD (0), DriveWire (1), or MEMDISK (2); extracts `driver-DWDVR.s`; reclaims dead RAM disk code to preserve low memory headroom (< `0x001300`). |
+| [`patches/0005-local-sd-driver.patch`](patches/0005-local-sd-driver.patch) | [`4cfdf76`](https://github.com/rlucente-retro/trs-os-zds/commit/4cfdf76) | Implements `driver-SDDVR.s` in high memory (`0x00F400`), configures Port B GPIOs and SPI0 Master @ 4.608 MHz, implements 512B-to-256B sector translation, adds `sddvr_base_lba` tracking, and lowers `COREEND$` to `0x00F3FF`. |
 
 ```
 +------------------------------------+          +-----------------------+
