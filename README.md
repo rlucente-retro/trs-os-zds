@@ -67,7 +67,7 @@ The build pipeline applies five sequential, modular patches to adapt upstream TR
    * The Olimex MOD-WIFI-ESP8266 communicates at **115,200 baud** by default.
    * The Agon Light 2 operates with an **18.432 MHz** crystal oscillator.
    * The eZ80 Baud Rate Generator (BRG) divisor formula yields an exact integer with 0% error:
-     $$\text{Divisor} = \frac{18,432,000}{16 \times 115,200} = 10 \quad (\text{0x000A})$$
+     `Divisor = 18,432,000 / (16 * 115,200) = 10 (0x000A)`
    * *Upstream Behavior:* Upstream equates assumed 230,400 baud and 20 MHz / 50 MHz dev-kit clocks, which yielded invalid divisor values on the Agon Light 2.
    * *Patch Fix:* Updates `DEVICE.serialnet.baud EQU 115200` and calculates divisors against `18432000`.
 

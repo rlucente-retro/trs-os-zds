@@ -222,14 +222,14 @@ On the Agon family, the eZ80 communicates with the MOD-WIFI-ESP8266 across the d
 Software running on the eZ80 can interface with UART1 at two levels:
 * **High-Level MOS APIs:** Standard MOS system calls (`mos_uopen`, `mos_uclose`, `mos_ugetc`, `mos_uputc`) that manage serial framing and operate against an interrupt-driven software circular buffer in eZ80 RAM.
 * **Direct Hardware Register Access:** Direct I/O access to the eZ80 UART1 registers to maximize throughput and eliminate operating system overhead during high-speed streaming:
-  * `UART1_RBR` (I/O `$D0`, DLAB=0, Read): Receiver Buffer Register (reads top of 16-byte RX FIFO).
-  * `UART1_THR` (I/O `$D0`, DLAB=0, Write): Transmitter Holding Register (writes to TX shift register/FIFO).
-  * `UART1_IER` (I/O `$D1`, DLAB=0): Interrupt Enable Register (Bit 0 = `RIE` receiver interrupt, Bit 1 = `TIE` transmit empty interrupt, Bit 3 = `MSIE` modem status interrupt).
-  * `UART1_IIR` / `UART1_FCR` (I/O `$D2`): Shared address. Reading returns the Interrupt Identification Register (`IIR`). Writing configures the FIFO Control Register (`FCR`): Bit 0 (`FIFOEN`) enables the 16-byte hardware FIFOs, Bits 1–2 clear FIFOs, and Bits 6–7 select the RX FIFO trigger threshold (00 = 1 byte, 01 = 4 bytes, 10 = 8 bytes, 11 = 14 bytes).
-  * `UART1_LCR` (I/O `$D3`): Line Control Register. Bits 0–1 set character length (11 = 8 bits). Bit 7 is `DLAB` (Divisor Latch Access Bit), which must be set to 1 to write baud divisor registers and cleared to 0 for normal data I/O.
-  * `UART1_LSR` (I/O `$D5`): Line Status Register. Bit 0 = `DR` (Data Ready), Bit 1 = `OE` (Overrun Error), Bit 5 = `THRE` (Transmitter Holding Register Empty), Bit 6 = `TEMT` (Transmitter Empty).
-  * `UART1_BRG_L` / `UART1_BRG_H` (I/O `$D0`/`$D1`, DLAB=1): Baud Rate Generator divisor registers. For a system clock of 18.432 MHz and target baud rate of 115,200 bps:
-    $$\text{Divisor} = \frac{18,432,000}{16 \times 115,200} = 10 \quad (\text{0x000A})$$
+  * `UART1_RBR` (I/O `0xD0`, DLAB=0, Read): Receiver Buffer Register (reads top of 16-byte RX FIFO).
+  * `UART1_THR` (I/O `0xD0`, DLAB=0, Write): Transmitter Holding Register (writes to TX shift register/FIFO).
+  * `UART1_IER` (I/O `0xD1`, DLAB=0): Interrupt Enable Register (Bit 0 = `RIE` receiver interrupt, Bit 1 = `TIE` transmit empty interrupt, Bit 3 = `MSIE` modem status interrupt).
+  * `UART1_IIR` / `UART1_FCR` (I/O `0xD2`): Shared address. Reading returns the Interrupt Identification Register (`IIR`). Writing configures the FIFO Control Register (`FCR`): Bit 0 (`FIFOEN`) enables the 16-byte hardware FIFOs, Bits 1–2 clear FIFOs, and Bits 6–7 select the RX FIFO trigger threshold (00 = 1 byte, 01 = 4 bytes, 10 = 8 bytes, 11 = 14 bytes).
+  * `UART1_LCR` (I/O `0xD3`): Line Control Register. Bits 0–1 set character length (11 = 8 bits). Bit 7 is `DLAB` (Divisor Latch Access Bit), which must be set to 1 to write baud divisor registers and cleared to 0 for normal data I/O.
+  * `UART1_LSR` (I/O `0xD5`): Line Status Register. Bit 0 = `DR` (Data Ready), Bit 1 = `OE` (Overrun Error), Bit 5 = `THRE` (Transmitter Holding Register Empty), Bit 6 = `TEMT` (Transmitter Empty).
+  * `UART1_BRG_L` / `UART1_BRG_H` (I/O `0xD0`/`0xD1`, DLAB=1): Baud Rate Generator divisor registers. For a system clock of 18.432 MHz and target baud rate of 115,200 bps:
+    `Divisor = 18,432,000 / (16 * 115,200) = 10 (0x000A)`
     Setting `BRG_L = 10` and `BRG_H = 0` produces exact 115,200 baud with 0.00% clock timing error.
 
 
