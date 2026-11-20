@@ -77,7 +77,7 @@ Phase 2 Step 3 Deliverables:
 
 --- /dev/null
 +++ b/TRSDOS_7/SYSRES/drivers/driver-SDDVR.s
-@@ -0,0 +1,273 @@
+@@ -0,0 +1,298 @@
 +		SUBTITLE	"<Local MicroSD SPI0 Storage Driver>"
 +		newpage
 +
@@ -213,43 +213,63 @@ Phase 2 Step 3 Deliverables:
 +		call	z,sddvr_init
 +
 +		; 1. Check if requested drive has a valid non-zero BaseLBA
++		;    (Preserve IX — LS-DOS holds active FCB pointer in IX across driver calls!)
 +		ld	a,(LDRV$)
 +		and	07h
 +		sla	a
 +		sla	a				; A = drive * 4
 +		ld	e,a
 +		ld	d,0
-+		ld	ix,sddvr_base_lba
-+		add	ix,de				; IX -> sddvr_base_lba[drive]
++		ld	hl,sddvr_base_lba
++		add	hl,de				; HL -> sddvr_base_lba[drive]
 +
-+		ld	a,(ix+0)
-+		or	(ix+1)
-+		or	(ix+2)
-+		or	(ix+3)
++		push	hl				; Save ptr to sddvr_base_lba[drive]
++		ld	a,(hl)
++		inc	hl
++		or	(hl)
++		inc	hl
++		or	(hl)
++		inc	hl
++		or	(hl)
++		pop	hl				; Restore ptr (flags preserved)
 +		jp	z,fdc_rd_err			; Drive not mounted -> Error 3 (Data lost)
 +
-+		; 2. Calculate SD Block LBA = BaseLBA + (LSN / 2)
-+		; Sub-sector = LSN & 1
-+		ld	de,(fdc_no_sum)			; DE = 16-bit LSN
++		; 2. Calculate SD Block LBA = BaseLBA + ((LSN + dw_offset[drive]) / 2)
++		; Sub-sector = (LSN + dw_offset[drive]) & 1
++		push	hl				; Save ptr to sddvr_base_lba[drive]
++		ld	a,(LDRV$)
++		and	07h
++		ld	e,a
++		ld	d,0
++		ld	hl,dw_offset
++		add	hl,de
++		ld	e,(hl)				; E = container offset (0=JV1, 1=DiskDISK)
++		ld	hl,(fdc_no_sum)			; HL = 16-bit LSN
++		add	hl,de				; HL = effective 256-byte sector index
++		ex	de,hl				; DE = effective LSN
 +		ld	a,e
 +		and	01h
 +		ld	(sd_subsector),a		; 0 = lower 256B, 1 = upper 256B
 +
 +		srl	d
-+		rr	e				; DE = LSN / 2
++		rr	e				; DE = effective LSN / 2
 +
 +		; 32-bit addition: BaseLBA + DE
-+		; Little-endian: (ix+0)=LSB, (ix+1), (ix+2), (ix+3)=MSB
-+		ld	a,(ix+0)
++		; Little-endian: (hl+0)=LSB, (hl+1), (hl+2), (hl+3)=MSB
++		pop	hl				; HL -> sddvr_base_lba[drive]
++		ld	a,(hl)
++		inc	hl
 +		add	a,e
 +		ld	(sd_cmd_buf+4),a		; CMD17 packet LSB
-+		ld	a,(ix+1)
++		ld	a,(hl)
++		inc	hl
 +		adc	a,d
 +		ld	(sd_cmd_buf+3),a
-+		ld	a,(ix+2)
++		ld	a,(hl)
++		inc	hl
 +		adc	a,0
 +		ld	(sd_cmd_buf+2),a
-+		ld	a,(ix+3)
++		ld	a,(hl)
 +		adc	a,0
 +		ld	(sd_cmd_buf+1),a		; CMD17 packet MSB
 +
@@ -270,6 +290,11 @@ Phase 2 Step 3 Deliverables:
 +		djnz	sd_cmd_loop
 +
 +		; 4. Wait for R1 response (bit 7 = 0)
++		; Some SPI emulators (e.g. fab-agon-emulator) return R1 on byte 6 (CRC).
++		; Real SD hardware returns 0xFF (bit 7 = 1) on byte 6 and R1 on a kick.
++		bit	7,a
++		jr	z,sd_r1_ok
++
 +		ld	b,255
 +sd_wait_r1:	call	spi_kick
 +		bit	7,a
