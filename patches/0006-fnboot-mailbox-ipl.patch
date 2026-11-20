@@ -1,0 +1,61 @@
+Subject: [PATCH] Phase 4 Step 3: Support FNBOOT pre-staged Local SD boot and pre-mounted drives in ipl-BIOS.s
+
+- Check drv_target_table[0] in ipl-BIOS.s: if 0 (Local SD), read raw LSN 0 of
+  Drive :0 via FDCDVR/SDDVR instead of DriveWire UART1, enabling pure Local SD
+  boot with zero FujiNet server dependency.
+- Preserve pre-mounted Drive :1 when FNBOOT sets the Alien controller flag
+  (bit 4 of DCT1$+4) while keeping legacy OSboot behavior unchanged.
+
+--- a/TRSDOS_7/SYS0_IPL/ipl-BIOS.s
++++ b/TRSDOS_7/SYS0_IPL/ipl-BIOS.s
+@@ -41,7 +41,25 @@
+ 
+ pastshawn	PUMP	DEVICE.console,splashiplmode	; Report CPU registers initialized.
+-				
++
++; Check drv_target_table[0]: 0 = Local SD boot, 1 = DriveWire (FujiNet) boot
++		ld	a,(drv_target_table)
++		or	a
++		jr	nz,ipl_rd_dw0
++
++; Local SD boot for Drive :0: read raw wire sector 0 via FDCDVR/SDDVR
++		xor	a
++		ld	(dw_offset),a
++		ld	iy,DCT0$
++		ld	hl,volbuf
++		ld	d,0
++		ld	e,0
++		ld	c,0
++		ld	b,9
++		call	FDCDVR
++		jp	nz,mounterr0
++		jr	ipl_chk_hdr0
++
++ipl_rd_dw0:
+ ; Read FujiNet Slot 0 LSN 0 (raw sector 0 / container header) over UART1
+ 		ld	a,07h				; Flush UART1 FIFOs
+ 		out0	(UART1_FCTL),a
+@@ -71,6 +89,7 @@
+ 		or	a
+ 		jp	nz,mounterr0
+ 
++ipl_chk_hdr0:
+ ; Test if first 8 bytes match 'DiskDISK'
+ 		ld	bc,8
+ 		ld	hl,string1$			; 'DiskDISK'
+@@ -191,10 +210,13 @@
+ 
+ nosysgenmsg	CKDRIVE		0,mounterr0		; See if TRSDOS finds formatted media it can read. If not, stop IPL.
+ 
+-; Phase 1: Set Drive 1 inactive (stub RET)
++; Preserve Drive :1 if pre-mounted by FNBOOT (Alien controller bit 4 set in DCT1$+4);
++; otherwise set Drive 1 inactive (stub RET) for legacy OSboot compatibility.
+ 		ld	iy,DCT1$
++		bit	4,(iy+4)
++		jr	nz,keep_drv1
+ 		ld	(iy+0),0C9h			; RET opcode -> Drive 1 inactive
+-		ld	iy,DCT0$
++keep_drv1:	ld	iy,DCT0$
+ 
+ flushkbd	LD	DE,KIDCB$			;  Flush keyboard, type,init ptrs.
+ 		LD	A,3
