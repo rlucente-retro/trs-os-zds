@@ -1,0 +1,618 @@
+Subject: [PATCH] Phase 4 Step 4: Implement SPI0 CMD24 512-byte Read-Modify-Write in driver-SDDVR.s
+
+- Lower COREEND$ from 0xF3FF to 0xF1FF to reserve 512 bytes (0xF200..0xF3FF) for
+  the 256-byte RMW sibling buffer (sd_rmw_buf) and sddvr_write_sector while keeping
+  the fixed lowcore mailbox at 0xF400 (sddvr_base_lba=0xF408, sddvr_map_lba=0xF428,
+  sddvr_map_len=0xF42C) completely unchanged.
+- Update DOWRIT in driver-FDCDVR.s (keeping exact 20-byte footprint so dw_offset
+  remains at 0x0F78) to preserve DE/HL, compute 16-bit LSN via calcsec, and
+  dispatch Local SD writes to sddvr_write_sector.
+- Implement full SPI0 CMD17+CMD24 Read-Modify-Write in driver-SDDVR.s with DCT
+  write-protect enforcement (bit 7 of DCT+3), Data Response Token validation,
+  busy-wait completion, and emulator + real hardware SPI0 compatibility.
+
+--- a/TRSDOS_GLOBAL/equates/equates-versions.s
++++ b/TRSDOS_GLOBAL/equates/equates-versions.s
+@@ -36,7 +36,7 @@
+ 
+ COREMAX$		EQU   	START$+2400h		; Start of application area when no library zone used.
+ COREMIN$		EQU   	START$+3000h		; Start of application area with active library area.
+-COREEND$		EQU	0F3FFh			; End of usable memory below high driver area (0F400h).
++COREEND$		EQU	0F1FFh			; End of usable memory below high driver area (0F200h).
+ 
+ ENDRAM$			EQU	10000H-1
+ 
+--- a/TRSDOS_7/TRSDOS.s
++++ b/TRSDOS_7/TRSDOS.s
+@@ -155,7 +155,7 @@
+ 		GOTO	zICNFG					; Here we start initilization chain.		
+ 		SUBTITLE	"< SYSRES HIGH memory region. >"
+ 		
+-		ORG	0F400h
++		ORG	0F200h
+ 		INCLUDE "driver-SDDVR.s"			; Local MicroSD SPI0 driver
+ 
+ ; HIGH$ memory contains video RAM, interrupt handler, reboot code etc.
+--- a/TRSDOS_7/SYSRES/drivers/driver-FDCDVR.s
++++ b/TRSDOS_7/SYSRES/drivers/driver-FDCDVR.s
+@@ -173,22 +173,19 @@
+ 		RETURN					; Return with NZ flag set indicating error.
+ 
+ 
+-DOWRIT		; Route sector write via drv_target_table
+-		call	get_drv_target
++DOWRIT		; Route sector write via drv_target_table (fixed 20B footprint)
++		push	de				; Save track/sector
++		push	hl				; Save 16-bit write buffer pointer
++		call	calcsec				; Compute 16-bit LSN -> (fdc_no_sum)
++		call	get_drv_target			; A = target (0=SD, 1=DW)
+ 		or	a
+-		jr	z,wr_local_sd			; Target 0: Local SD
+-		dec	a
+-		jp	z,wr_drivewire			; Target 1: DriveWire
+-		; Invalid target fallback
+-		pop	bc
+-		pop	hl
+-		ld	a,14				; Write fault
+-		or	a
+-		ei
+-		ret
+-
+-wr_local_sd:
+-		jp	sddvr_write_sector		; Call local SD write driver
++		jp	z,sddvr_write_sector		; Target 0: Local SD RMW driver
++		pop	hl				; Restore stack for DriveWire / non-SD
++		pop	de
++		jp	wr_drivewire			; Stage 1 non-SD: Write Protected
++		nop
++		nop
++		nop
+ 
+ ; IY points to DCTx$
+ ; D - contains track.
+--- a/TRSDOS_7/SYSRES/drivers/driver-SDDVR.s
++++ b/TRSDOS_7/SYSRES/drivers/driver-SDDVR.s
+@@ -5,42 +5,196 @@
+ ; driver-SDDVR.s - Local MicroSD Card SPI0 Block Driver for TRS-OS (TRSDOS 7)
+ ; Target Platform: Olimex Agon Light 2 (Zilog eZ80F92 @ 18.432 MHz)
+ ;
+-; Provides raw physical sector read and write protection for .dsk disk images
+-; residing on the Agon Light 2 on-board microSD card via hardware SPI0.
++; Provides raw physical 512-byte block Read (CMD17) and Read-Modify-Write
++; (CMD17 + CMD24) for .dsk disk images residing on the Agon Light 2 microSD
++; card via hardware SPI0.
+ ;
+ ; Block Translation:
+ ;   SD card physical blocks = 512 bytes
+ ;   TRSDOS logical sectors   = 256 bytes (1 SD block = 2 TRSDOS sectors)
+-;   SD Block LBA = BaseLBA + (LSN / 2)
+-;   Sub-sector   = LSN & 1 (0 = lower 256 bytes, 1 = upper 256 bytes)
++;   SD Block LBA = BaseLBA + ((LSN + dw_offset[drive]) / 2)
++;   Sub-sector   = (LSN + dw_offset[drive]) & 1 (0 = lower 256B, 1 = upper 256B)
++;
++; Memory Layout (below INTERRUPT.handler at 0xF600):
++;   0xF200..0xF2FF : sd_rmw_buf (256-byte sibling sub-sector buffer)
++;   0xF300..0xF3FF : sddvr_write_sector (CMD17/CMD24 RMW write driver)
++;   0xF400..0xF447 : Fixed lowcore mailbox (sddvr_inited, sddvr_base_lba,
++;                    sddvr_map_lba @ 0xF428, sddvr_map_len @ 0xF42C)
++;   0xF448..0xF5F4 : sddvr_init, SPI0 helpers, sddvr_read_sector
+ ; ==============================================================================
+ 
+-; SD SPI Command Definitions
++; SD SPI Command & Token Definitions
+ CMD17_READ_BLOCK	EQU	40h + 17	; 0x51: READ_SINGLE_BLOCK
+ CMD24_WRITE_BLOCK	EQU	40h + 24	; 0x58: WRITE_SINGLE_BLOCK
+-DATA_START_TOKEN	EQU	0FEh		; Data token for Single Block Read
+-
+-; ------------------------------------------------------------------------------
+-; Driver State & Working Storage
+-; ------------------------------------------------------------------------------
++DATA_START_TOKEN	EQU	0FEh		; Data start token (CMD17 & CMD24)
++
++; ------------------------------------------------------------------------------
++; 0xF200..0xF2FF: 256-Byte Sibling Sub-Sector Buffer for 512B Read-Modify-Write
++; ------------------------------------------------------------------------------
++sd_rmw_buf:		ds	256
++
++; ------------------------------------------------------------------------------
++; sddvr_write_sector - Write 256-byte sector via 512-byte SD Read-Modify-Write
++;
++; Entry:
++;   Stack: [saved HL (source buffer)], [saved DE (track/sector)], [saved BC], [saved HL]
++;   IY: DCTx$ pointer (bit 7 of (IY+3) = Write Protect)
++;   (fdc_no_sum): 16-bit logical sector number calculated by calcsec
++;   (LDRV$): requested logical drive (0..7)
++;   Preserves IX (LS-DOS holds active FCB pointer in IX across driver calls).
++; Exit:
++;   Success: restores DE, BC, HL; returns A=0 (Z set), EI
++;   RO/WP:   restores DE, BC, HL; returns A=15 (R_PROTECTED, NZ set), EI
++;   Error:   restores DE, BC, HL; returns A=14 (Write Fault, NZ set), EI
++; ------------------------------------------------------------------------------
++sddvr_write_sector:
++		; 0. Enforce DCT write-protect flag (bit 7 of DCT+3)
++		bit	7,(iy+3)
++		jp	nz,sd_wr_prot
++
++		; 1. Ensure hardware SPI0 is initialized
++		ld	a,(sddvr_inited)
++		or	a
++		call	z,sddvr_init
++
++		; 2. Compute 32-bit SD Block LBA and sub-sector selector
++		call	sd_prep_lba
++		jp	c,sd_wr_err
++
++		; 3. Phase 1 (Read): CMD17 read of existing 512B block, retaining
++		;    the sibling 256B half in sd_rmw_buf.
++		ld	a,CMD17_READ_BLOCK
++		call	sd_send_cmd
++		jp	c,sd_wr_err
++		call	sd_wait_fe
++		jp	c,sd_wr_err
++
++		ld	hl,sd_rmw_buf
++		ld	a,(sd_subsector)
++		or	a
++		jr	nz,sd_w_keep_lo
++
++		; Writing lower half (0): discard lower 256B, keep upper 256B
++		call	sd_disc_256
++		call	sd_rx_256
++		jr	sd_w_rd_crc
++
++		; Writing upper half (1): keep lower 256B, discard upper 256B
++sd_w_keep_lo:	call	sd_rx_256
++		call	sd_disc_256
++
++sd_w_rd_crc:	call	spi_kick			; Discard 2-byte CRC
++		call	spi_kick
++		call	sd_deselect			; Finish CMD17 cleanly
++
++		; 4. Phase 2 (Write): CMD24 write merged 512B block back to same LBA
++		ld	a,CMD24_WRITE_BLOCK
++		call	sd_send_cmd			; sd_cmd_buf+1..4 still holds LBA
++		jp	c,sd_wr_err
++
++		call	spi_kick			; Nwr >= 1 idle byte before token
++		ld	a,DATA_START_TOKEN		; 0xFE
++		call	spi_tx_rx
++
++		pop	hl				; Recover caller 256B write buffer
++		push	hl				; Keep copy on stack for cleanup
++		ld	a,(sd_subsector)
++		or	a
++		jr	nz,sd_w_tx_upper
++
++		; Sub-sector 0: TX caller buffer (lower), then sd_rmw_buf (upper)
++		call	sd_tx_256
++		ld	hl,sd_rmw_buf
++		call	sd_tx_256
++		jr	sd_w_tx_crc
++
++		; Sub-sector 1: TX sd_rmw_buf (lower), then caller buffer (upper)
++sd_w_tx_upper:	push	hl
++		ld	hl,sd_rmw_buf
++		call	sd_tx_256
++		pop	hl
++		call	sd_tx_256
++
++		; 5. Send 2-byte dummy CRC & verify Data Response Token (xxx00101b)
++		;    Note: fab-agon-emulator emits 0x05 on data byte 512 (currently in A)
++		;    and 0x01 on CRC byte 1; real SD cards emit 0xFF on both and send
++		;    0xE5 after CRC byte 2. Capture A, drain CRC bytes, then validate.
++sd_w_tx_crc:	ld	c,a				; Save MISO from data byte 512
++		call	spi_kick			; CRC byte 1 (drains emulator 0x01)
++		call	spi_kick			; CRC byte 2
++		ld	b,a				; Save MISO from CRC byte 2
++		ld	a,c
++		cp	0FFh
++		jr	nz,sd_w_chk_resp		; Emulator token on byte 512
++		ld	a,b
++		cp	0FFh
++		jr	nz,sd_w_chk_resp		; Token on CRC byte 2
++		ld	b,32
++sd_w_wait_resp:	call	spi_kick			; Real hardware: poll post-CRC
++		cp	0FFh
++		jr	nz,sd_w_chk_resp
++		djnz	sd_w_wait_resp
++		call	sd_deselect
++		jp	sd_wr_err
++
++sd_w_chk_resp:	and	1Fh
++		cp	05h				; 00101b = Data Accepted
++		jr	z,sd_w_wait_busy
++		call	sd_deselect
++		jp	sd_wr_err
++
++		; 6. Wait for SD flash programming busy (MISO low -> 0xFF idle)
++sd_w_wait_busy:	ld	d,4				; Up to ~450 ms @ 4.6 MHz SPI0
++sd_w_busy_out:	ld	bc,0
++sd_w_busy_in:	call	spi_kick
++		cp	0FFh
++		jr	z,sd_w_done
++		dec	bc
++		ld	a,b
++		or	c
++		jr	nz,sd_w_busy_in
++		dec	d
++		jr	nz,sd_w_busy_out
++		call	sd_deselect
++		jp	sd_wr_err
++
++sd_w_done:	call	sd_deselect
++		pop	hl				; Discard caller buffer ptr
++		pop	de				; Restore track/sector DE
++		pop	bc				; Restore entry BC
++		pop	hl				; Restore entry HL
++		xor	a				; A=0, Z set (success)
++		ei
++		ret
++
++sd_wr_prot:	pop	hl
++		pop	de
++		pop	bc
++		pop	hl
++		ld	a,15				; Error 15 = R_PROTECTED
++		or	a				; NZ
++		ei
++		ret
++
++sd_wr_err:	pop	hl
++		pop	de
++		pop	bc
++		pop	hl
++		ld	a,14				; Error 14 = Write Fault
++		or	a				; NZ
++		ei
++		ret
++
++; ==============================================================================
++; Fixed Lowcore Mailbox Region (0xF400) -- ABI locked with FNBOOT/SDMOUNT/DRVMAP
++; ==============================================================================
++		ORG	0F400h
++
+ sddvr_inited:	db	0				; 0 = uninitialized, 1 = initialized
+ sd_subsector:	db	0				; Sub-sector selector (0 or 1)
+-sd_cmd_buf:	db	0, 0, 0, 0, 0, 0FFh		; 6-byte CMD17 packet buffer
++sd_cmd_buf:	db	0, 0, 0, 0, 0, 0FFh		; 6-byte CMD17/CMD24 packet buffer
+ 
+ ; 8-entry table of 32-bit physical starting LBAs (1 per logical drive :0..:7)
+-; Populated at mount time by pre-boot launcher (FNBOOT) or in-DOS SDMOUNT.
+-; Little-endian: [LSB, byte1, byte2, MSB]
++; Note: ZDS dd reserves 8B/item -> 64B (0xF408..0xF447), housing:
++;   sddvr_base_lba : 0xF408..0xF427 (8 x 4B LE)
++;   sddvr_map_lba  : 0xF428..0xF42B (4B LE)
++;   sddvr_map_len  : 0xF42C..0xF42D (2B LE)
+ sddvr_base_lba:
+-		dd	0, 0, 0, 0, 0, 0, 0, 0		; 32 bytes (8 drives x 4 bytes)
++		dd	0, 0, 0, 0, 0, 0, 0, 0
+ 
+ ; ------------------------------------------------------------------------------
+ ; sddvr_init - Initialize eZ80 SPI0 and Port B GPIOs for Agon MicroSD Card
+-;
+-; Port B Pin Assignments on Agon Light 2:
+-;   PB1 = MOSI (SPI0 Out)  -> Mode 7 (Alternate Function: DDR=1, ALT1=0, ALT2=1)
+-;   PB2 = MISO (SPI0 In)   -> Mode 7 (Alternate Function: DDR=1, ALT1=0, ALT2=1)
+-;   PB3 = SCK  (SPI0 Clock)-> Mode 7 (Alternate Function: DDR=1, ALT1=0, ALT2=1)
+-;   PB4 = /CS  (Chip Sel)  -> Mode 2 (GPIO Output:       DDR=0, ALT1=0, ALT2=0)
+ ; ------------------------------------------------------------------------------
+ sddvr_init:
+ 		push	af
+@@ -73,17 +227,12 @@
+ 		or	10h
+ 		out0	(PB_DR),a
+ 
+-		; Reset and configure SPI0 controller
++		; Reset and configure SPI0 controller (4.608 MHz, Master Mode 0)
+ 		xor	a
+-		out0	(SPI_CTL),a			; Disable SPI0 during setup
+-
+-		; Set SPI0 BRG Divisor:
+-		; 18.432 MHz / (2 * 2) = 4.608 MHz high-speed SPI transfer clock
++		out0	(SPI_CTL),a
+ 		ld	bc,2
+ 		out0	(SPI_BRG_H),b
+ 		out0	(SPI_BRG_L),c
+-
+-		; Enable SPI0 as Master: CPOL=0, CPHA=0, SPI_EN=1, MASTER_EN=1 (30h)
+ 		ld	a,30h
+ 		out0	(SPI_CTL),a
+ 
+@@ -95,45 +244,29 @@
+ 		ret
+ 
+ ; ------------------------------------------------------------------------------
+-; Low-Level SPI Helper Routines
++; Shared Low-Level SPI0 & SD Command Helpers (Preserve IX and IY)
+ ; ------------------------------------------------------------------------------
+ spi_kick:	ld	a,0FFh
+-spi_tx_rx:	out0	(SPI_TSR),a			; Transmit byte across SPI0
+-spi_wait:	in0	a,(SPI_SR)			; Poll SPI status register
+-		jp	p,spi_wait			; Wait while bit 7 (SPIF) is 0
+-		in0	a,(SPI_RBR)			; Read received byte
+-		ret
+-
+-sd_select:	in0	a,(PB_DR)			; Assert /CS (PB4 low)
++spi_tx_rx:	out0	(SPI_TSR),a
++spi_wait:	in0	a,(SPI_SR)
++		jp	p,spi_wait
++		in0	a,(SPI_RBR)
++		ret
++
++sd_select:	in0	a,(PB_DR)
+ 		and	0EFh
+ 		out0	(PB_DR),a
+ 		ret
+ 
+-sd_deselect:	in0	a,(PB_DR)			; Deassert /CS (PB4 high)
++sd_deselect:	in0	a,(PB_DR)
+ 		or	10h
+ 		out0	(PB_DR),a
+-		call	spi_kick			; Provide 8 trailing clocks
+-		ret
+-
+-; ------------------------------------------------------------------------------
+-; sddvr_read_sector - Read 256-byte sector from local microSD via SPI0
+-;
+-; Entry:
+-;   Stack: [saved HL (destination buffer)], [saved DE (track/sector)], [saved BC], [saved HL]
+-;   (fdc_no_sum): 16-bit logical sector number calculated by calcsec
+-;   (LDRV$): requested logical drive (0..7)
+-; Exit:
+-;   Success: jumps to rd_finish (pops DE, checks system cylinder, restores regs, returns)
+-;   Failure: jumps to fdc_rd_err (pops buffer, DE, BC, HL, returns A=03h NZ)
+-; ------------------------------------------------------------------------------
+-sddvr_read_sector:
+-		; Ensure hardware SPI0 is initialized
+-		ld	a,(sddvr_inited)
+-		or	a
+-		call	z,sddvr_init
+-
+-		; 1. Check if requested drive has a valid non-zero BaseLBA
+-		;    (Preserve IX â LS-DOS holds active FCB pointer in IX across driver calls!)
++		call	spi_kick
++		ret
++
++; sd_prep_lba - Validate drive BaseLBA and compute big-endian SD LBA & sub-sector
++; Exit: Carry clear = OK (sd_cmd_buf+1..4 & sd_subsector populated), Carry set = unmounted
++sd_prep_lba:
+ 		ld	a,(LDRV$)
+ 		and	07h
+ 		sla	a
+@@ -143,7 +276,7 @@
+ 		ld	hl,sddvr_base_lba
+ 		add	hl,de				; HL -> sddvr_base_lba[drive]
+ 
+-		push	hl				; Save ptr to sddvr_base_lba[drive]
++		push	hl
+ 		ld	a,(hl)
+ 		inc	hl
+ 		or	(hl)
+@@ -151,11 +284,10 @@
+ 		or	(hl)
+ 		inc	hl
+ 		or	(hl)
+-		pop	hl				; Restore ptr (flags preserved)
+-		jp	z,fdc_rd_err			; Drive not mounted -> Error 3 (Data lost)
+-
+-		; 2. Calculate SD Block LBA = BaseLBA + ((LSN + dw_offset[drive]) / 2)
+-		; Sub-sector = (LSN + dw_offset[drive]) & 1
++		pop	hl
++		scf
++		ret	z				; BaseLBA == 0 -> unmounted
++
+ 		push	hl				; Save ptr to sddvr_base_lba[drive]
+ 		ld	a,(LDRV$)
+ 		and	07h
+@@ -165,22 +297,19 @@
+ 		add	hl,de
+ 		ld	e,(hl)				; E = container offset (0=JV1, 1=DiskDISK)
+ 		ld	hl,(fdc_no_sum)			; HL = 16-bit LSN
+-		add	hl,de				; HL = effective 256-byte sector index
+-		ex	de,hl				; DE = effective LSN
++		add	hl,de				; HL = effective 256B sector
++		ex	de,hl
+ 		ld	a,e
+ 		and	01h
+-		ld	(sd_subsector),a		; 0 = lower 256B, 1 = upper 256B
+-
++		ld	(sd_subsector),a
+ 		srl	d
+ 		rr	e				; DE = effective LSN / 2
+ 
+-		; 32-bit addition: BaseLBA + DE
+-		; Little-endian: (hl+0)=LSB, (hl+1), (hl+2), (hl+3)=MSB
+-		pop	hl				; HL -> sddvr_base_lba[drive]
++		pop	hl				; HL -> sddvr_base_lba[drive] (LE)
+ 		ld	a,(hl)
+ 		inc	hl
+ 		add	a,e
+-		ld	(sd_cmd_buf+4),a		; CMD17 packet LSB
++		ld	(sd_cmd_buf+4),a		; LBA LSB
+ 		ld	a,(hl)
+ 		inc	hl
+ 		adc	a,d
+@@ -191,17 +320,18 @@
+ 		ld	(sd_cmd_buf+2),a
+ 		ld	a,(hl)
+ 		adc	a,0
+-		ld	(sd_cmd_buf+1),a		; CMD17 packet MSB
+-
+-		ld	a,CMD17_READ_BLOCK		; 0x51
++		ld	(sd_cmd_buf+1),a		; LBA MSB
++		or	a				; Clear Carry
++		ret
++
++; sd_send_cmd - Select card, transmit 6B command in A + sd_cmd_buf+1..4, verify R1==0
++; Exit: Carry clear = R1==0 (card stays selected); Carry set = error (card deselected)
++sd_send_cmd:
+ 		ld	(sd_cmd_buf+0),a
+ 		ld	a,0FFh
+-		ld	(sd_cmd_buf+5),a		; Dummy CRC
+-
+-		; 3. Assert /CS and transmit 6-byte CMD17 packet
++		ld	(sd_cmd_buf+5),a
+ 		call	sd_select
+-		call	spi_kick			; Synchronization clock
+-
++		call	spi_kick
+ 		ld	hl,sd_cmd_buf
+ 		ld	b,6
+ sd_cmd_loop:	ld	a,(hl)
+@@ -209,90 +339,87 @@
+ 		call	spi_tx_rx
+ 		djnz	sd_cmd_loop
+ 
+-		; 4. Wait for R1 response (bit 7 = 0)
+-		; Some SPI emulators (e.g. fab-agon-emulator) return R1 on byte 6 (CRC).
+-		; Real SD hardware returns 0xFF (bit 7 = 1) on byte 6 and R1 on a kick.
++		; Handle both emulator (immediate R1 on byte 6) and real hardware (0xFF then R1)
+ 		bit	7,a
+-		jr	z,sd_r1_ok
+-
++		jr	z,sd_r1_chk
+ 		ld	b,255
+ sd_wait_r1:	call	spi_kick
+ 		bit	7,a
+-		jr	z,sd_r1_ok
++		jr	z,sd_r1_chk
+ 		djnz	sd_wait_r1
+-		call	sd_deselect			; R1 timeout
+-		jp	fdc_rd_err
+-
+-sd_r1_ok:	or	a
+-		jr	z,sd_wait_data			; 0x00 = success
+-		call	sd_deselect			; Non-zero = command error
+-		jp	fdc_rd_err
+-
+-		; 5. Wait for Data Start Token (0xFE)
+-sd_wait_data:	ld	bc,5000
++		call	sd_deselect
++		scf
++		ret
++
++sd_r1_chk:	or	a
++		ret	z				; Carry clear if R1 == 0x00
++		call	sd_deselect
++		scf
++		ret
++
++; sd_wait_fe - Poll for Data Start Token (0xFE)
++sd_wait_fe:	ld	bc,5000
+ sd_wait_tok:	call	spi_kick
+-		cp	DATA_START_TOKEN		; 0xFE
+-		jr	z,sd_read_payload
++		cp	DATA_START_TOKEN
++		ret	z				; Carry clear on match
+ 		dec	bc
+ 		ld	a,b
+ 		or	c
+ 		jr	nz,sd_wait_tok
+-		call	sd_deselect			; Token timeout
+-		jp	fdc_rd_err
+-
+-		; 6. Read 512-byte payload with 256-byte sub-sector filtering
+-sd_read_payload:
+-		pop	hl				; Recover destination user buffer pointer
++		call	sd_deselect
++		scf
++		ret
++
++; 256-byte SPI0 transfer helpers
++sd_rx_256:	ld	b,0
++sd_rx_lp:	call	spi_kick
++		ld	(hl),a
++		inc	hl
++		djnz	sd_rx_lp
++		ret
++
++sd_disc_256:	ld	b,0
++sd_disc_lp:	call	spi_kick
++		djnz	sd_disc_lp
++		ret
++
++sd_tx_256:	ld	b,0
++sd_tx_lp:	ld	a,(hl)
++		inc	hl
++		call	spi_tx_rx
++		djnz	sd_tx_lp
++		ret
++
++; ------------------------------------------------------------------------------
++; sddvr_read_sector - Read 256-byte sector from local microSD via SPI0 (CMD17)
++; ------------------------------------------------------------------------------
++sddvr_read_sector:
++		ld	a,(sddvr_inited)
++		or	a
++		call	z,sddvr_init
++
++		call	sd_prep_lba
++		jp	c,fdc_rd_err
++
++		ld	a,CMD17_READ_BLOCK
++		call	sd_send_cmd
++		jp	c,fdc_rd_err
++		call	sd_wait_fe
++		jp	c,fdc_rd_err
++
++		pop	hl				; Recover destination user buffer
+ 		ld	a,(sd_subsector)
+ 		or	a
+ 		jr	nz,sd_read_upper
+ 
+-		; Sub-sector 0: Read first 256 bytes into buffer, discard second 256 bytes
+-		ld	b,0				; 256 bytes
+-sd_r0_buf:	call	spi_kick
+-		ld	(hl),a
+-		inc	hl
+-		djnz	sd_r0_buf
+-
+-		ld	b,0				; 256 bytes discard
+-sd_r0_disc:	call	spi_kick
+-		djnz	sd_r0_disc
++		call	sd_rx_256			; Lower 256B -> user buffer
++		call	sd_disc_256			; Discard upper 256B
+ 		jr	sd_read_crc
+ 
+-		; Sub-sector 1: Discard first 256 bytes, read second 256 bytes into buffer
+-sd_read_upper:
+-		ld	b,0				; 256 bytes discard
+-sd_r1_disc:	call	spi_kick
+-		djnz	sd_r1_disc
+-
+-		ld	b,0				; 256 bytes
+-sd_r1_buf:	call	spi_kick
+-		ld	(hl),a
+-		inc	hl
+-		djnz	sd_r1_buf
+-
+-		; 7. Read and discard 2-byte CRC
+-sd_read_crc:	call	spi_kick
++sd_read_upper:	call	sd_disc_256			; Discard lower 256B
++		call	sd_rx_256			; Upper 256B -> user buffer
++
++sd_read_crc:	call	spi_kick			; Discard 2-byte CRC
+ 		call	spi_kick
+-
+-		; 8. Deassert /CS
+-		call	sd_deselect
+-
+-		; 9. Clean exit via authentic LS-DOS handler
++		call	sd_deselect
+ 		jp	rd_finish
+-
+-; ------------------------------------------------------------------------------
+-; sddvr_write_sector - Write 256-byte sector to local microSD (Stage 1/2: Read-Only)
+-;
+-; Entry:
+-;   Stack: [saved BC], [saved HL]
+-; Exit:
+-;   Returns A=15 (R_PROTECTED / Write Protected) with NZ set
+-; ------------------------------------------------------------------------------
+-sddvr_write_sector:
+-		pop	bc				; Recovered from save on entry to driver
+-		pop	hl				; Per Soltoff restore on exit registers used
+-		ld	a,15				; Error 15 = R_PROTECTED (Write Protected)
+-		or	a				; Set NZ for error
+-		ei
+-		ret
