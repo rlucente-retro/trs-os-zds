@@ -61,7 +61,7 @@ if [[ -z "$ATTACHED_DEV" ]]; then
 fi
 
 echo "==> Copying contents from $SRC_DIR..."
-cp -R "$SRC_DIR/." "$MOUNT_DIR/"
+COPYFILE_DISABLE=1 cp -X -R "$SRC_DIR/." "$MOUNT_DIR/"
 
 echo "==> Stripping macOS metadata..."
 rm -rf "$MOUNT_DIR/.fseventsd"
